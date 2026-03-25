@@ -8,9 +8,16 @@ import pandas as pd
 import io
 from datetime import datetime
 
+from concepts import DEFAULT_CONCEPTS_PATH, load_bank_concepts
 from parsers import BANK_PARSERS, detect_bank, parse_mayor
 from engine  import reconcile
 from exporter import build_excel
+
+
+if "uploader_nonce" not in st.session_state:
+    st.session_state.uploader_nonce = 0
+if "last_reconciliation" not in st.session_state:
+    st.session_state.last_reconciliation = None
 
 # ── Configuración de página ──────────────────────────────────────────────────
 st.set_page_config(
@@ -197,7 +204,7 @@ with col1:
     st.markdown('<div class="upload-label">📄 Extracto Bancario</div>', unsafe_allow_html=True)
     bank_file = st.file_uploader(
         "Extracto del banco", type=["xls", "xlsx"],
-        key="bank", label_visibility="collapsed"
+        key=f"bank_{st.session_state.uploader_nonce}", label_visibility="collapsed"
     )
     if bank_file:
         detected = detect_bank(bank_file)
@@ -211,7 +218,7 @@ with col2:
     st.markdown('<div class="upload-label">📊 Mayor de Cuentas (ERP)</div>', unsafe_allow_html=True)
     mayor_file = st.file_uploader(
         "Mayor de cuentas", type=["xlsx"],
-        key="mayor", label_visibility="collapsed"
+        key=f"mayor_{st.session_state.uploader_nonce}", label_visibility="collapsed"
     )
     if mayor_file:
         st.markdown('<div class="bank-badge" style="background:#F0FDF4;color:#15803D;border-color:#BBF7D0;">✓ Archivo cargado</div>', unsafe_allow_html=True)
@@ -222,24 +229,33 @@ if bank_file and not detect_bank(bank_file):
     bank_file.seek(0)
     banco_manual = st.selectbox(
         "Seleccioná el banco manualmente",
-        list(BANK_PARSERS.keys())
+        list(BANK_PARSERS.keys()),
+        key=f"banco_manual_{st.session_state.uploader_nonce}",
     )
 
 # Período (opcional, informativo)
 periodo_input = st.text_input(
     "Período (opcional, para el nombre del archivo)",
     placeholder="ej: Diciembre 2025",
-    label_visibility="visible"
+    label_visibility="visible",
+    key=f"periodo_{st.session_state.uploader_nonce}",
 )
 
 # ── Botón de análisis ─────────────────────────────────────────────────────────
 st.markdown("<br>", unsafe_allow_html=True)
-run_col, _ = st.columns([1, 2])
-with run_col:
-    run = st.button("▶  Ejecutar Conciliación", use_container_width=True)
+has_result = st.session_state.last_reconciliation is not None
+cta_col, _ = st.columns([1, 2])
+with cta_col:
+    action_label = "Nueva Conciliación" if has_result else "▶  Ejecutar Conciliación"
+    action_clicked = st.button(action_label, use_container_width=True)
+
+if action_clicked and has_result:
+    st.session_state.uploader_nonce += 1
+    st.session_state.last_reconciliation = None
+    st.rerun()
 
 # ── Procesamiento ─────────────────────────────────────────────────────────────
-if run:
+if action_clicked and not has_result:
     if not bank_file or not mayor_file:
         st.markdown('<div class="alert alert-error">⚠ Necesitás subir ambos archivos antes de ejecutar.</div>', unsafe_allow_html=True)
         st.stop()
@@ -258,24 +274,40 @@ if run:
             bank_file.seek(0)
             bank_df  = BANK_PARSERS[banco](bank_file)
             mayor_df = parse_mayor(mayor_file)
-            result   = reconcile(bank_df, mayor_df)
+            bank_concepts = load_bank_concepts().get(banco, [])
+            result   = reconcile(bank_df, mayor_df, bank_concepts=bank_concepts)
 
             periodo = periodo_input.strip() or (
                 f"{bank_df['Fecha'].min().strftime('%d/%m/%Y')} — {bank_df['Fecha'].max().strftime('%d/%m/%Y')}"
                 if not bank_df.empty else "—"
             )
+            st.session_state.last_reconciliation = {
+                "result": result,
+                "banco": banco,
+                "periodo": periodo,
+            }
+            st.rerun()
 
         except Exception as e:
             st.error(f"Error al procesar los archivos: {e}")
             st.stop()
 
+current_reconciliation = st.session_state.last_reconciliation
+
+if current_reconciliation:
+    result = current_reconciliation["result"]
+    banco = current_reconciliation["banco"]
+    periodo = current_reconciliation["periodo"]
+    banco_icon = {"BBVA": "🟦", "BNA": "🟩", "Macro": "🟧", "Santander": "🟥"}.get(banco, "🏦")
+
     # ── Banner de resultado ────────────────────────────────────────────────
-    if result.total_faltantes == 0:
+    total_alertas = result.total_faltantes + result.total_pendientes_agrupados
+    if total_alertas == 0:
         st.markdown('<div class="alert alert-ok">✅ <strong>Conciliación perfecta</strong> — Todos los movimientos del banco están registrados en el sistema.</div>', unsafe_allow_html=True)
-    elif result.total_faltantes <= 10:
-        st.markdown(f'<div class="alert alert-warn">⚠ <strong>{result.total_faltantes} movimiento(s) sin registrar</strong> — Revisá los detalles abajo.</div>', unsafe_allow_html=True)
+    elif total_alertas <= 10:
+        st.markdown(f'<div class="alert alert-warn">⚠ <strong>{total_alertas} alerta(s) de conciliación</strong> — Revisá los detalles abajo.</div>', unsafe_allow_html=True)
     else:
-        st.markdown(f'<div class="alert alert-error">🚨 <strong>{result.total_faltantes} movimientos sin registrar en el sistema</strong> — Requiere atención.</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="alert alert-error">🚨 <strong>{total_alertas} alertas de conciliación</strong> — Requiere atención.</div>', unsafe_allow_html=True)
 
     # ── KPI cards ─────────────────────────────────────────────────────────
     pct = result.pct_conciliado
@@ -299,10 +331,10 @@ if run:
         </div>""", unsafe_allow_html=True)
     with c3:
         st.markdown(f"""
-        <div class="stat-card {'error' if result.total_faltantes > 0 else 'ok'}">
-          <div class="stat-label">⚠ Sin registrar</div>
-          <div class="stat-value">{result.total_faltantes}</div>
-          <div class="stat-sub">en sistema ERP</div>
+        <div class="stat-card {'error' if total_alertas > 0 else 'ok'}">
+          <div class="stat-label">⚠ Alertas</div>
+          <div class="stat-value">{total_alertas}</div>
+          <div class="stat-sub">directas + agrupadas</div>
         </div>""", unsafe_allow_html=True)
     with c4:
         total_falt_amt = result.monto_faltantes_creditos + result.monto_faltantes_debitos
@@ -317,16 +349,25 @@ if run:
 
     # ── Tabs de detalle ────────────────────────────────────────────────────
     tab1, tab2, tab3, tab4 = st.tabs([
-        f"🚨 Faltantes ({result.total_faltantes})",
+        f"🚨 Faltantes y agrupados ({total_alertas})",
         f"📋 Extracto completo ({result.banco_total})",
         f"📒 Mayor sin banco ({len(result.mayor_sin_banco_debe) + len(result.mayor_sin_banco_haber)})",
         "📥 Descargar",
     ])
 
     with tab1:
-        if result.total_faltantes == 0:
-            st.success("✅ No hay movimientos faltantes. La conciliación está completa.")
+        if total_alertas == 0:
+            st.success("✅ No hay movimientos pendientes. La conciliación está completa.")
         else:
+            if not result.gastos_impuestos_resumen.empty:
+                st.markdown('<div class="section-title">Impuestos y gastos bancarios conciliados en forma agrupada mensual</div>', unsafe_allow_html=True)
+                st.dataframe(
+                    result.gastos_impuestos_resumen.style.format({"Monto": "${:,.2f}"}),
+                    use_container_width=True, hide_index=True
+                )
+                if not result.gastos_impuestos_detalle.empty:
+                    st.caption("Los conceptos clasificados por la planilla externa se excluyen de la conciliación directa y se consolidan por mes.")
+
             if not result.faltantes_creditos.empty:
                 st.markdown('<div class="section-title">Créditos en banco sin asiento en mayor</div>', unsafe_allow_html=True)
                 st.dataframe(
@@ -347,8 +388,10 @@ if run:
         st.markdown('<div class="section-title">Todos los movimientos del extracto bancario</div>', unsafe_allow_html=True)
 
         def highlight_estado(row):
-            if row.get("Estado") == "⚠ No en sistema":
+            if row.get("Estado") in {"⚠ No en sistema", "⚠ Agrupado mensual pendiente"}:
                 return ["background-color: #FEF2F2"] * len(row)
+            if row.get("Estado") == "✓ Conciliado agrupado mensual":
+                return ["background-color: #FFF7ED"] * len(row)
             return ["background-color: #F0FDF4" if i % 2 == 0 else "" for i in range(len(row))]
 
         styled = result.banco_completo.style.apply(highlight_estado, axis=1)
@@ -376,10 +419,14 @@ if run:
         st.markdown("""
         El archivo Excel incluye:
         - **Resumen ejecutivo** con KPIs y estado general
+        - **Gastos e Impuestos Agrupados** conciliados por mes contra el mayor
         - **Faltantes Créditos** y **Faltantes Débitos** destacados
         - **Mayor sin Banco** — asientos que están en el sistema pero no en el extracto
         - **Extracto Completo** con cada movimiento marcado como conciliado o faltante
         """)
+
+        if not DEFAULT_CONCEPTS_PATH.exists():
+            st.warning(f"No se encontró el archivo de configuración de conceptos en {DEFAULT_CONCEPTS_PATH}.")
 
         excel_bytes = build_excel(result, banco, periodo)
         fname = f"Conciliacion_{banco}_{periodo.replace(' ', '_').replace('/', '-')}.xlsx"
@@ -394,6 +441,6 @@ if run:
 
 st.markdown("""
 <div class="footer">
-  Conciliador Bancario · Soporta BBVA, BNA, Macro, Santander
+  Conciliador Bancario by Ascent
 </div>
 """, unsafe_allow_html=True)

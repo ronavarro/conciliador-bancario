@@ -1,0 +1,38 @@
+{
+  "BBVA": [
+    "IMPUESTO LEY",
+    "COM.TRANSF COMISION",
+    "IVA TASA GRA",
+    "COMISION TRA"
+  ],
+  "BNA": [
+    "GRAVAMEN LEY 25413 S/DEB",
+    "REG.REC.SIRCREB",
+    "GRAVAMEN LEY 25413 S/CRED",
+    "COMISION PAQUETES",
+    "I.V.A. BASE",
+    "RETEN. I.V.A. RG.2408",
+    "COM TRANSFE ELECTRONICA",
+    "IMPUESTO AL CREDITO",
+    "IMPUESTO AL DEBITO",
+    "I.B.REG RE",
+    "IVA %",
+    "CO.TRF.ELE"
+  ],
+  "Macro": [
+    "IMPUESTO AL DEBITO",
+    "RRSIRCREB",
+    "IMPUESTO AL CREDITO",
+    "COM.SERV",
+    "IVA 21%"
+  ],
+  "Santander": [
+    "IMPUESTO AL DEBITO",
+    "RRSIRCREB",
+    "IMPUESTO AL CREDITO",
+    "CO.TRF.ELE",
+    "IVA",
+    "IMPUESTOS",
+    "COM.V/COB"
+  ]
+}
