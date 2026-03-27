@@ -45,6 +45,8 @@ def parse_bbva(file) -> pd.DataFrame:
     ]
     df["Debito"]  = pd.to_numeric(df["Debito"],  errors="coerce").fillna(0)
     df["Credito"] = pd.to_numeric(df["Credito"], errors="coerce").fillna(0)
+    # BBVA exporta débitos como valores positivos; el motor espera negativos
+    df["Debito"] = -df["Debito"].abs()
     return _clean_df(df)
 
 
@@ -98,6 +100,37 @@ def parse_mayor(file) -> pd.DataFrame:
     df["Descripcion"] = df["Descripcion"].astype(str).str.strip()
     df["Asiento"]     = df["Asiento"].astype(str).str.strip()
     return df.reset_index(drop=True)
+
+
+def parse_supplier_table(file) -> pd.DataFrame:
+    """Tabla opcional de proveedores para enriquecer matching de transferencias."""
+    df = pd.read_excel(file)
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    for col in ["cuit", "company_name", "alias"]:
+        if col not in df.columns:
+            df[col] = ""
+    df = df[["cuit", "company_name", "alias"]].copy()
+    df["cuit"] = df["cuit"].astype(str).str.replace(r"\D", "", regex=True)
+    df["company_name"] = df["company_name"].astype(str).str.strip()
+    df["alias"] = df["alias"].astype(str).str.strip()
+    return df[df[["cuit", "company_name", "alias"]].any(axis=1)].reset_index(drop=True)
+
+
+def parse_cheques_aux(file) -> pd.DataFrame:
+    """Archivo auxiliar de cheques emitidos (opcional)."""
+    df = pd.read_excel(file)
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    for col in ["cheque_number", "issue_date", "amount", "bank", "supplier", "status"]:
+        if col not in df.columns:
+            df[col] = ""
+    df = df[["cheque_number", "issue_date", "amount", "bank", "supplier", "status"]].copy()
+    df["cheque_number"] = df["cheque_number"].astype(str).str.replace(r"\D", "", regex=True)
+    df["issue_date"] = pd.to_datetime(df["issue_date"], dayfirst=True, errors="coerce")
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0)
+    df["bank"] = df["bank"].astype(str).str.strip()
+    df["supplier"] = df["supplier"].astype(str).str.strip()
+    df["status"] = df["status"].astype(str).str.strip()
+    return df[df["cheque_number"] != ""].reset_index(drop=True)
 
 
 # ──────────────────────────────────────────────

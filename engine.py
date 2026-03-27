@@ -1,19 +1,26 @@
 """
 engine.py — Motor de conciliación bancaria.
 
-Lógica: para cada movimiento del banco (identificado por fecha + importe),
+Lógica base: para cada movimiento del banco (identificado por fecha + importe),
 busca una contrapartida en el Mayor de Cuentas.
   - Crédito banco  ↔  Debe en mayor
   - Débito banco   ↔  Haber en mayor
-Tolerancia de diferencia: $0.02 (redondeos)
+
+Sobre esta base se agregan pases incrementales configurables para casos especiales:
+  1) Cargos/impuestos bancarios consolidados
+  2) Transferencias con tolerancia de fecha y agrupación
+  3) Cheques de períodos previos (archivo auxiliar)
+  4) Enriquecimiento opcional por CUIT/proveedor
+  5) Detección de movimientos de fondos comunes
 """
 
 from __future__ import annotations
-import pandas as pd
-import numpy as np
+import re
 from dataclasses import dataclass, field
 
-from concepts import is_bank_charge
+import pandas as pd
+
+from reconciliation_config import DEFAULT_RECONCILIATION_CONFIG
 
 
 @dataclass
@@ -36,19 +43,16 @@ class ReconciliationResult:
 
     # Banco completo con estado
     banco_completo: pd.DataFrame = field(default_factory=pd.DataFrame)
-    gastos_impuestos_resumen: pd.DataFrame = field(default_factory=pd.DataFrame)
-    gastos_impuestos_detalle: pd.DataFrame = field(default_factory=pd.DataFrame)
-    conciliados_agrupados: int = 0
+
+    # Gastos e impuestos bancarios (separados de faltantes)
+    gastos_impuestos: pd.DataFrame = field(default_factory=pd.DataFrame)
+
+    # Trazabilidad
+    decision_log: list[str] = field(default_factory=list)
 
     @property
     def total_faltantes(self):
         return len(self.faltantes_creditos) + len(self.faltantes_debitos)
-
-    @property
-    def total_pendientes_agrupados(self):
-        if self.gastos_impuestos_resumen.empty:
-            return 0
-        return int((self.gastos_impuestos_resumen["Estado"] == "⚠ Pendiente en mayor").sum())
 
     @property
     def monto_faltantes_creditos(self):
@@ -59,227 +63,374 @@ class ReconciliationResult:
         return self.faltantes_debitos["Debito"].sum() if not self.faltantes_debitos.empty else 0
 
     @property
+    def monto_gastos_impuestos(self):
+        return self.gastos_impuestos["Debito"].abs().sum() if not self.gastos_impuestos.empty else 0
+
+    @property
     def pct_conciliado(self):
         return (self.conciliados / self.banco_total * 100) if self.banco_total else 0
 
 
-def reconcile(bank_df: pd.DataFrame, mayor_df: pd.DataFrame, bank_concepts: list[str] | None = None) -> ReconciliationResult:
-    """
-    Parámetros
-    ----------
-    bank_df  : output de cualquier parser de banco (schema canónico)
-    mayor_df : output de parse_mayor()
-    """
-    TOL = 0.02
+def _norm_text(value: str) -> str:
+    return str(value or "").strip().lower()
+
+
+def _extract_cuit(text: str) -> str:
+    found = re.findall(r"\b\d{11}\b", str(text or ""))
+    return found[0] if found else ""
+
+
+def _extract_cheque_number(text: str) -> str:
+    m = re.search(r"(?:cheque|chq)\D*(\d{4,10})", str(text or ""), re.IGNORECASE)
+    return m.group(1) if m else ""
+
+
+def _is_transfer(text: str, transfer_patterns: list[str]) -> bool:
+    tx = _norm_text(text)
+    return any(pat in tx for pat in transfer_patterns)
+
+
+def _is_fund_movement(text: str, fund_patterns: list[str]) -> bool:
+    tx = _norm_text(text)
+    return any(pat in tx for pat in fund_patterns)
+
+
+def _bank_charge_candidate(text: str, include: list[str], exclude: list[str], fund_patterns: list[str]) -> bool:
+    tx = _norm_text(text)
+    if any(pat in tx for pat in exclude):
+        return False
+    if any(pat in tx for pat in fund_patterns):
+        return False
+    return any(pat in tx for pat in include)
+
+
+def _build_df_from_indexes(bank_df: pd.DataFrame, idxs: list[int]) -> pd.DataFrame:
+    cols = ["Fecha", "Concepto", "Comprobante", "Credito", "Debito"]
+    if not idxs:
+        return pd.DataFrame(columns=cols)
+    out = bank_df.loc[idxs, cols].copy()
+    out["Fecha"] = pd.to_datetime(out["Fecha"]).dt.strftime("%d/%m/%Y")
+    return out.sort_values("Fecha").reset_index(drop=True)
+
+
+def reconcile(
+    bank_df: pd.DataFrame,
+    mayor_df: pd.DataFrame,
+    banco: str | None = None,
+    config: dict | None = None,
+    supplier_df: pd.DataFrame | None = None,
+    cheques_df: pd.DataFrame | None = None,
+) -> ReconciliationResult:
+    cfg = {**DEFAULT_RECONCILIATION_CONFIG, **(config or {})}
+    tol = float(cfg["amount_tolerance"])
 
     bank_df = bank_df.copy()
-    bank_df["_is_charge"] = bank_df["Concepto"].apply(lambda value: is_bank_charge(value, bank_concepts or []))
+    mayor_df = mayor_df.copy()
+    bank_df["_idx"] = bank_df.index
+    bank_df["_matched"] = False
+    bank_df["_match_type"] = ""
+    bank_df["_match_reason"] = ""
 
-    # Filtrar período del banco en el mayor
+    decision_log: list[str] = []
+
+    # Filtrar período del banco en el mayor (lógica existente)
     if not bank_df.empty:
-        date_min = bank_df["Fecha"].min().to_period("M").to_timestamp(how="start").normalize()
-        date_max = bank_df["Fecha"].max().to_period("M").to_timestamp(how="end").normalize()
-        mayor_df = mayor_df[
-            (mayor_df["Fecha"] >= date_min) &
-            (mayor_df["Fecha"] <= date_max)
-        ].copy()
+        date_min = bank_df["Fecha"].min()
+        date_max = bank_df["Fecha"].max()
+        mayor_df = mayor_df[(mayor_df["Fecha"] >= date_min) & (mayor_df["Fecha"] <= date_max)].copy()
 
     # Pools separados: Debe (ingresos al banco) y Haber (egresos del banco)
-    pool_debe  = mayor_df[mayor_df["Debe"]  > 0][["Fecha", "Descripcion", "Debe",  "Asiento"]].copy().reset_index(drop=True)
+    pool_debe = mayor_df[mayor_df["Debe"] > 0][["Fecha", "Descripcion", "Debe", "Asiento"]].copy().reset_index(drop=True)
     pool_haber = mayor_df[mayor_df["Haber"] > 0][["Fecha", "Descripcion", "Haber", "Asiento"]].copy().reset_index(drop=True)
-    pool_debe["_used"]  = False
+    pool_debe["_used"] = False
     pool_haber["_used"] = False
 
-    bank_direct = bank_df[~bank_df["_is_charge"]].copy()
-    bank_grouped = bank_df[bank_df["_is_charge"]].copy()
-
-    bank_cred = bank_direct[bank_direct["Credito"] > 0].copy()
-    bank_deb  = bank_direct[bank_direct["Debito"]  < 0].copy()
+    bank_cred = bank_df[bank_df["Credito"] > 0].copy()
+    bank_deb = bank_df[bank_df["Debito"] < 0].copy()
     bank_deb["_abs"] = bank_deb["Debito"].abs()
 
-    matched_cred, unmatched_cred = [], []
+    # MATCH PASS 1: Lógica original exacta fecha+importe
+    matched_cred_idx, unmatched_cred_idx = [], []
     for _, row in bank_cred.iterrows():
         mask = (
-            (pool_debe["Fecha"] == row["Fecha"]) &
-            (abs(pool_debe["Debe"] - row["Credito"]) < TOL) &
-            (~pool_debe["_used"])
+            (pool_debe["Fecha"] == row["Fecha"])
+            & (abs(pool_debe["Debe"] - row["Credito"]) < tol)
+            & (~pool_debe["_used"])
         )
         hits = pool_debe[mask]
         if len(hits) > 0:
-            pool_debe.loc[hits.index[0], "_used"] = True
-            matched_cred.append(row)
+            hidx = hits.index[0]
+            pool_debe.loc[hidx, "_used"] = True
+            matched_cred_idx.append(int(row["_idx"]))
+            bank_df.loc[row["_idx"], ["_matched", "_match_type", "_match_reason"]] = [
+                True,
+                "exact_match",
+                "Matched by original exact rule (date+amount, crédito↔debe)",
+            ]
         else:
-            unmatched_cred.append(row)
+            unmatched_cred_idx.append(int(row["_idx"]))
 
-    matched_deb, unmatched_deb = [], []
+    matched_deb_idx, unmatched_deb_idx = [], []
     for _, row in bank_deb.iterrows():
         mask = (
-            (pool_haber["Fecha"] == row["Fecha"]) &
-            (abs(pool_haber["Haber"] - row["_abs"]) < TOL) &
-            (~pool_haber["_used"])
+            (pool_haber["Fecha"] == row["Fecha"])
+            & (abs(pool_haber["Haber"] - row["_abs"]) < tol)
+            & (~pool_haber["_used"])
         )
         hits = pool_haber[mask]
         if len(hits) > 0:
-            pool_haber.loc[hits.index[0], "_used"] = True
-            matched_deb.append(row)
+            hidx = hits.index[0]
+            pool_haber.loc[hidx, "_used"] = True
+            matched_deb_idx.append(int(row["_idx"]))
+            bank_df.loc[row["_idx"], ["_matched", "_match_type", "_match_reason"]] = [
+                True,
+                "exact_match",
+                "Matched by original exact rule (date+amount, débito↔haber)",
+            ]
         else:
-            unmatched_deb.append(row)
+            unmatched_deb_idx.append(int(row["_idx"]))
 
-    grouped_matches = []
-    grouped_pending = []
-    grouped_status_map = {}
-    grouped_detail = bank_grouped.copy()
+    # PASS 2: Cargos bancarios — gastos e impuestos
+    bank_name = banco or ""
+    rules = cfg.get("bank_rules", {}).get(bank_name, {})
+    include_patterns = rules.get("include_patterns", [])
+    exclude_patterns = rules.get("exclude_patterns", [])
+    fund_patterns = cfg.get("fund_patterns", [])
+    eom_tol = int(cfg.get("end_of_month_tolerance_days", 5))
+    cons_tol = float(cfg.get("consolidated_amount_tolerance", 1.0))
 
-    if not grouped_detail.empty:
-        grouped_detail["Periodo"] = grouped_detail["Fecha"].dt.to_period("M").astype(str)
-        grouped_detail["Tipo"] = np.where(grouped_detail["Credito"] > 0, "Credito", "Debito")
-        grouped_detail["MontoGrupo"] = np.where(
-            grouped_detail["Credito"] > 0,
-            grouped_detail["Credito"],
-            grouped_detail["Debito"].abs(),
+    debit_unmatched_df = bank_df.loc[unmatched_deb_idx].copy()
+    charge_candidates = debit_unmatched_df[
+        debit_unmatched_df["Concepto"].apply(
+            lambda x: _bank_charge_candidate(x, include_patterns, exclude_patterns, fund_patterns)
         )
+    ].copy()
 
-        grouped_summary = (
-            grouped_detail.groupby(["Periodo", "Tipo"], dropna=False)
-            .agg(
-                Cantidad=("Concepto", "size"),
-                Monto=("MontoGrupo", "sum"),
-            )
-            .reset_index()
-        )
+    gastos_impuestos_idxs: list[int] = []
 
-        for _, summary in grouped_summary.iterrows():
-            period = pd.Period(summary["Periodo"], freq="M")
-            month_end = period.to_timestamp(how="end").normalize()
-            candidate_dates = {month_end, month_end - pd.Timedelta(days=1)}
-            target_amount = float(summary["Monto"])
+    if not charge_candidates.empty:
+        # Sacar TODOS los candidatos de unmatched de antemano (no van a faltantes)
+        for bidx in charge_candidates["_idx"].tolist():
+            if bidx in unmatched_deb_idx:
+                unmatched_deb_idx.remove(bidx)
+            gastos_impuestos_idxs.append(bidx)
+            bank_df.loc[bidx, "_match_type"] = "gastos_impuestos"
 
-            if summary["Tipo"] == "Credito":
-                pool = pool_debe
-                amount_col = "Debe"
+        # Intentar conciliar contra mayor consolidado (opcional, sin penalizar si falla)
+        charge_candidates["_month"] = charge_candidates["Fecha"].dt.to_period("M")
+        for month, grp in charge_candidates.groupby("_month"):
+            grp_idxs = grp["_idx"].tolist()
+            total_abs = float(grp["Debito"].abs().sum())
+            m_end = month.to_timestamp("M")
+            candidates = pool_haber[
+                (~pool_haber["_used"])
+                & (pool_haber["Fecha"].dt.to_period("M") == month)
+                & ((pool_haber["Fecha"] - m_end).abs().dt.days <= eom_tol)
+                & (abs(pool_haber["Haber"] - total_abs) <= cons_tol)
+            ]
+
+            if len(candidates) == 1:
+                idx = candidates.index[0]
+                pool_haber.loc[idx, "_used"] = True
+                for bidx in grp_idxs:
+                    bank_df.loc[bidx, ["_matched", "_match_type", "_match_reason"]] = [
+                        True,
+                        "gastos_impuestos",
+                        f"Gastos/impuestos conciliados contra asiento único en mayor ({month})",
+                    ]
+                decision_log.append(f"Gastos/impuestos conciliados contra mayor ({month}, {len(grp_idxs)} movimientos).")
             else:
-                pool = pool_haber
-                amount_col = "Haber"
+                reason = (
+                    f"Gastos/impuestos de {month} — sin asiento consolidado en mayor"
+                    if len(candidates) == 0
+                    else f"Gastos/impuestos de {month} — múltiples candidatos en mayor"
+                )
+                for bidx in grp_idxs:
+                    bank_df.loc[bidx, "_match_reason"] = reason
 
-            mask = (
-                pool["Fecha"].isin(candidate_dates) &
-                (abs(pool[amount_col] - target_amount) < TOL) &
-                (~pool["_used"])
+    # PASS 3: Transferencias con tolerancia fecha + agrupación
+    transfer_patterns = cfg.get("transfer_include_patterns", [])
+    transfer_tol_days = int(cfg.get("transfer_date_tolerance_days", 3))
+
+    transfer_unmatched = bank_df.loc[unmatched_deb_idx + unmatched_cred_idx].copy()
+    transfer_unmatched = transfer_unmatched[
+        transfer_unmatched["Concepto"].apply(lambda x: _is_transfer(x, transfer_patterns))
+    ]
+
+    for _, row in transfer_unmatched.iterrows():
+        bidx = int(row["_idx"])
+        if bank_df.loc[bidx, "_matched"]:
+            continue
+
+        amount = row["Credito"] if row["Credito"] > 0 else abs(row["Debito"])
+        is_credit = row["Credito"] > 0
+        pool = pool_debe if is_credit else pool_haber
+        amount_col = "Debe" if is_credit else "Haber"
+
+        exact = pool[(~pool["_used"]) & (abs(pool[amount_col] - amount) < tol) & (pool["Fecha"] == row["Fecha"])]
+        if len(exact) > 0:
+            idx = exact.index[0]
+            pool.loc[idx, "_used"] = True
+            bank_df.loc[bidx, ["_matched", "_match_type", "_match_reason"]] = [
+                True,
+                "exact_match",
+                "Transfer matched by exact amount/date",
+            ]
+            if bidx in unmatched_cred_idx:
+                unmatched_cred_idx.remove(bidx)
+            if bidx in unmatched_deb_idx:
+                unmatched_deb_idx.remove(bidx)
+            continue
+
+        tol_hits = pool[
+            (~pool["_used"])
+            & (abs(pool[amount_col] - amount) < tol)
+            & ((pool["Fecha"] - row["Fecha"]).abs().dt.days <= transfer_tol_days)
+        ]
+        if len(tol_hits) == 1:
+            idx = tol_hits.index[0]
+            pool.loc[idx, "_used"] = True
+            delta = int((pool.loc[idx, "Fecha"] - row["Fecha"]).days)
+            bank_df.loc[bidx, ["_matched", "_match_type", "_match_reason"]] = [
+                True,
+                "match_with_date_tolerance",
+                f"Matched transfer with {delta:+d} day tolerance",
+            ]
+            decision_log.append(f"Matched transfer with {delta:+d} day tolerance.")
+            if bidx in unmatched_cred_idx:
+                unmatched_cred_idx.remove(bidx)
+            if bidx in unmatched_deb_idx:
+                unmatched_deb_idx.remove(bidx)
+            continue
+
+        # Agrupación: movimientos del mismo día/concepto que sumen un asiento
+        same_side_unmatched = bank_df.loc[
+            [i for i in (unmatched_cred_idx if is_credit else unmatched_deb_idx) if i != bidx]
+        ].copy()
+        if not same_side_unmatched.empty:
+            same_side_unmatched = same_side_unmatched[
+                same_side_unmatched["Concepto"].apply(lambda x: _is_transfer(x, transfer_patterns))
+            ]
+            group_candidates = same_side_unmatched[same_side_unmatched["Fecha"] == row["Fecha"]]
+            if not group_candidates.empty:
+                row_amount_col = "Credito" if is_credit else "Debito"
+                group_amount = amount + float(group_candidates[row_amount_col].abs().sum())
+                grp_hits = pool[(~pool["_used"]) & (abs(pool[amount_col] - group_amount) <= tol)]
+                if len(grp_hits) == 1:
+                    idx = grp_hits.index[0]
+                    pool.loc[idx, "_used"] = True
+                    group_idxs = [bidx] + group_candidates["_idx"].astype(int).tolist()
+                    for gidx in group_idxs:
+                        bank_df.loc[gidx, ["_matched", "_match_type", "_match_reason"]] = [
+                            True,
+                            "match_by_grouping",
+                            "Matched transfer by grouping multiple bank movements",
+                        ]
+                        if gidx in unmatched_cred_idx:
+                            unmatched_cred_idx.remove(gidx)
+                        if gidx in unmatched_deb_idx:
+                            unmatched_deb_idx.remove(gidx)
+                    decision_log.append("Matched transfer by grouping multiple bank movements.")
+                    continue
+
+        bank_df.loc[bidx, ["_match_type", "_match_reason"]] = [
+            "possible_match_suggestion",
+            "Transfer candidate found but not enough confidence to auto-match",
+        ]
+
+    # PASS 4: Cheques de períodos previos (si hay archivo auxiliar)
+    cheque_patterns = cfg.get("cheque_patterns", [])
+    if cheques_df is not None and not cheques_df.empty:
+        for bidx in list(unmatched_deb_idx):
+            row = bank_df.loc[bidx]
+            tx = _norm_text(row["Concepto"])
+            if not any(p in tx for p in cheque_patterns):
+                continue
+            chq_no = _extract_cheque_number(row["Concepto"])
+            if not chq_no:
+                continue
+            hit = cheques_df[cheques_df["cheque_number"].astype(str) == chq_no]
+            if hit.empty:
+                continue
+            amt = abs(float(row["Debito"]))
+            amt_hits = hit[abs(hit["amount"] - amt) <= tol]
+            if amt_hits.empty:
+                continue
+
+            bank_df.loc[bidx, ["_matched", "_match_type", "_match_reason"]] = [
+                True,
+                "reconciled_previous_period_cheque",
+                "Matched cheque issued in previous period",
+            ]
+            unmatched_deb_idx.remove(bidx)
+            decision_log.append("Matched cheque issued in previous period.")
+
+    # PASS 5: Enriquecimiento opcional por CUIT/proveedor
+    if supplier_df is not None and not supplier_df.empty:
+        for bidx in unmatched_deb_idx + unmatched_cred_idx:
+            row = bank_df.loc[bidx]
+            cuit = _extract_cuit(row.get("Concepto", ""))
+            if not cuit:
+                continue
+            sup = supplier_df[supplier_df["cuit"].astype(str) == cuit]
+            if sup.empty:
+                continue
+            names = ", ".join(
+                filter(None, (sup.iloc[0].get("company_name", ""), sup.iloc[0].get("alias", "")))
             )
-            hits = pool[mask]
+            prev_reason = bank_df.loc[bidx, "_match_reason"]
+            add = f"CUIT matched with supplier table: {names or cuit}"
+            bank_df.loc[bidx, "_match_reason"] = f"{prev_reason} | {add}" if prev_reason else add
 
-            detail_mask = (
-                (grouped_detail["Periodo"] == summary["Periodo"]) &
-                (grouped_detail["Tipo"] == summary["Tipo"])
-            )
+    # PASS 6: Detección fondos comunes — no clasificar como cargos
+    for bidx in unmatched_deb_idx + unmatched_cred_idx:
+        if bank_df.loc[bidx, "_matched"]:
+            continue
+        if _is_fund_movement(bank_df.loc[bidx, "Concepto"], fund_patterns):
+            bank_df.loc[bidx, ["_match_type", "_match_reason"]] = [
+                "possible_missing_ledger_entry_fund_movement",
+                "Potential missing ledger entry (fund movement)",
+            ]
+            decision_log.append("Potential missing ledger entry.")
 
-            if len(hits) > 0:
-                hit = hits.iloc[0]
-                pool.loc[hit.name, "_used"] = True
-                grouped_matches.append({
-                    "Periodo": summary["Periodo"],
-                    "Tipo": summary["Tipo"],
-                    "Cantidad": int(summary["Cantidad"]),
-                    "Monto": target_amount,
-                    "FechaMayor": hit["Fecha"].strftime("%d/%m/%Y"),
-                    "Asiento": hit["Asiento"],
-                    "DescripcionMayor": hit["Descripcion"],
-                    "Estado": "✓ Conciliado agrupado",
-                })
-                grouped_status_map[(summary["Periodo"], summary["Tipo"])] = "✓ Conciliado agrupado mensual"
-            else:
-                grouped_pending.append({
-                    "Periodo": summary["Periodo"],
-                    "Tipo": summary["Tipo"],
-                    "Cantidad": int(summary["Cantidad"]),
-                    "Monto": target_amount,
-                    "FechaMayor": "",
-                    "Asiento": "",
-                    "DescripcionMayor": "",
-                    "Estado": "⚠ Pendiente en mayor",
-                })
-                grouped_status_map[(summary["Periodo"], summary["Tipo"])] = "⚠ Agrupado mensual pendiente"
-    else:
-        grouped_summary = pd.DataFrame(columns=["Periodo", "Tipo", "Cantidad", "Monto"])
+    # Construcción salida
+    faltantes_cred = _build_df_from_indexes(bank_df, unmatched_cred_idx)
+    faltantes_deb = _build_df_from_indexes(bank_df, unmatched_deb_idx)
+    gastos_impuestos_df = _build_df_from_indexes(bank_df, gastos_impuestos_idxs)
 
-    # Construir DataFrames de resultado
-    def _to_df(lst, cols):
-        if not lst:
-            return pd.DataFrame(columns=cols)
-        df = pd.DataFrame(lst)[cols].copy()
-        df["Fecha"] = pd.to_datetime(df["Fecha"]).dt.strftime("%d/%m/%Y")
-        return df.sort_values("Fecha").reset_index(drop=True)
-
-    fc_cols = ["Fecha", "Concepto", "Comprobante", "Credito"]
-    fd_cols = ["Fecha", "Concepto", "Comprobante", "Debito"]
-
-    faltantes_cred = _to_df(unmatched_cred, fc_cols)
-    faltantes_deb  = _to_df(unmatched_deb,  fd_cols)
-
-    mayor_sb_debe  = pool_debe[~pool_debe["_used"]][["Fecha","Descripcion","Asiento","Debe"]].copy()
-    mayor_sb_haber = pool_haber[~pool_haber["_used"]][["Fecha","Descripcion","Asiento","Haber"]].copy()
+    mayor_sb_debe = pool_debe[~pool_debe["_used"]][["Fecha", "Descripcion", "Asiento", "Debe"]].copy()
+    mayor_sb_haber = pool_haber[~pool_haber["_used"]][["Fecha", "Descripcion", "Asiento", "Haber"]].copy()
     for df in [mayor_sb_debe, mayor_sb_haber]:
         df["Fecha"] = pd.to_datetime(df["Fecha"]).dt.strftime("%d/%m/%Y")
 
-    # Banco completo con estado
-    unc_cred_keys = set(
-        (r["Fecha"], r["Concepto"], round(r["Credito"], 2))
-        for r in unmatched_cred
-    )
-    unc_deb_keys = set(
-        (r["Fecha"], r["Concepto"], round(r["Debito"], 2))
-        for r in unmatched_deb
-    )
-
     banco_completo = bank_df.copy()
-    if not grouped_detail.empty:
-        banco_completo["Periodo"] = banco_completo["Fecha"].dt.to_period("M").astype(str)
-        banco_completo["TipoMovimiento"] = np.where(banco_completo["Credito"] > 0, "Credito", "Debito")
 
-    banco_completo["Estado"] = banco_completo.apply(
-        lambda r: grouped_status_map.get((r.get("Periodo"), r.get("TipoMovimiento")))
-        if r.get("_is_charge")
-        else (
-            "⚠ No en sistema"
-            if (r["Fecha"], r["Concepto"], round(r["Credito"], 2)) in unc_cred_keys
-            or (r["Fecha"], r["Concepto"], round(r["Debito"], 2)) in unc_deb_keys
-            else "✓ Conciliado"
-        ),
-        axis=1,
-    )
-    banco_completo["Clasificacion"] = np.where(
-        banco_completo["_is_charge"],
-        "Impuestos/Gastos bancarios",
-        "Conciliacion directa",
-    )
+    def _estado(r):
+        if r["_matched"]:
+            return "✓ Conciliado"
+        mt = r.get("_match_type", "")
+        if mt:
+            return f"⚠ {mt}"
+        return "⚠ No en sistema"
+
+    banco_completo["Estado"] = banco_completo.apply(_estado, axis=1)
+    banco_completo["Traza"] = banco_completo["_match_reason"]
     banco_completo["Fecha"] = banco_completo["Fecha"].dt.strftime("%d/%m/%Y")
-    banco_completo = banco_completo.drop(columns=["_is_charge"], errors="ignore")
-    banco_completo = banco_completo.drop(columns=["Periodo", "TipoMovimiento"], errors="ignore")
-
-    grouped_detail_out = pd.DataFrame(columns=["Fecha", "Periodo", "Concepto", "Comprobante", "Credito", "Debito"])
-    if not grouped_detail.empty:
-        grouped_detail_out = grouped_detail[["Fecha", "Periodo", "Concepto", "Comprobante", "Credito", "Debito"]].copy()
-        grouped_detail_out["Fecha"] = grouped_detail_out["Fecha"].dt.strftime("%d/%m/%Y")
-        grouped_detail_out = grouped_detail_out.sort_values(["Periodo", "Fecha", "Concepto"]).reset_index(drop=True)
-
-    grouped_result = pd.DataFrame(grouped_matches + grouped_pending)
-    if not grouped_result.empty:
-        grouped_result = grouped_result.sort_values(["Periodo", "Tipo"]).reset_index(drop=True)
+    banco_completo = banco_completo.drop(columns=["_idx", "_matched", "_match_type", "_match_reason"], errors="ignore")
 
     return ReconciliationResult(
-        banco_total             = len(bank_df),
-        banco_creditos          = len(bank_cred),
-        banco_debitos           = len(bank_deb),
-        mayor_total             = len(mayor_df),
-        conciliados             = len(matched_cred) + len(matched_deb),
-        conciliados_creditos    = len(matched_cred),
-        conciliados_debitos     = len(matched_deb),
-        faltantes_creditos      = faltantes_cred,
-        faltantes_debitos       = faltantes_deb,
-        mayor_sin_banco_debe    = mayor_sb_debe.reset_index(drop=True),
-        mayor_sin_banco_haber   = mayor_sb_haber.reset_index(drop=True),
-        banco_completo          = banco_completo,
-        gastos_impuestos_resumen = grouped_result,
-        gastos_impuestos_detalle = grouped_detail_out,
-        conciliados_agrupados   = len(grouped_matches),
+        banco_total=len(bank_df),
+        banco_creditos=len(bank_cred),
+        banco_debitos=len(bank_deb),
+        mayor_total=len(mayor_df),
+        conciliados=int((banco_completo["Estado"] == "✓ Conciliado").sum()),
+        conciliados_creditos=int(((bank_df["Credito"] > 0) & (bank_df["_matched"])).sum()),
+        conciliados_debitos=int(((bank_df["Debito"] < 0) & (bank_df["_matched"])).sum()),
+        faltantes_creditos=faltantes_cred,
+        faltantes_debitos=faltantes_deb,
+        gastos_impuestos=gastos_impuestos_df,
+        mayor_sin_banco_debe=mayor_sb_debe.reset_index(drop=True),
+        mayor_sin_banco_haber=mayor_sb_haber.reset_index(drop=True),
+        banco_completo=banco_completo,
+        decision_log=decision_log,
     )
