@@ -44,6 +44,9 @@ class ReconciliationResult:
     # Banco completo con estado
     banco_completo: pd.DataFrame = field(default_factory=pd.DataFrame)
 
+    # Gastos e impuestos bancarios (separados de faltantes)
+    gastos_impuestos: pd.DataFrame = field(default_factory=pd.DataFrame)
+
     # Trazabilidad
     decision_log: list[str] = field(default_factory=list)
 
@@ -58,6 +61,10 @@ class ReconciliationResult:
     @property
     def monto_faltantes_debitos(self):
         return self.faltantes_debitos["Debito"].sum() if not self.faltantes_debitos.empty else 0
+
+    @property
+    def monto_gastos_impuestos(self):
+        return self.gastos_impuestos["Debito"].abs().sum() if not self.gastos_impuestos.empty else 0
 
     @property
     def pct_conciliado(self):
@@ -183,7 +190,7 @@ def reconcile(
         else:
             unmatched_deb_idx.append(int(row["_idx"]))
 
-    # PASS 2: Cargos bancarios consolidados
+    # PASS 2: Cargos bancarios — gastos e impuestos
     bank_name = banco or ""
     rules = cfg.get("bank_rules", {}).get(bank_name, {})
     include_patterns = rules.get("include_patterns", [])
@@ -199,7 +206,17 @@ def reconcile(
         )
     ].copy()
 
+    gastos_impuestos_idxs: list[int] = []
+
     if not charge_candidates.empty:
+        # Sacar TODOS los candidatos de unmatched de antemano (no van a faltantes)
+        for bidx in charge_candidates["_idx"].tolist():
+            if bidx in unmatched_deb_idx:
+                unmatched_deb_idx.remove(bidx)
+            gastos_impuestos_idxs.append(bidx)
+            bank_df.loc[bidx, "_match_type"] = "gastos_impuestos"
+
+        # Intentar conciliar contra mayor consolidado (opcional, sin penalizar si falla)
         charge_candidates["_month"] = charge_candidates["Fecha"].dt.to_period("M")
         for month, grp in charge_candidates.groupby("_month"):
             grp_idxs = grp["_idx"].tolist()
@@ -218,31 +235,18 @@ def reconcile(
                 for bidx in grp_idxs:
                     bank_df.loc[bidx, ["_matched", "_match_type", "_match_reason"]] = [
                         True,
-                        "reconciled_consolidated_bank_charges",
-                        f"Matched as consolidated bank charges for {month} against single ledger entry",
+                        "gastos_impuestos",
+                        f"Gastos/impuestos conciliados contra asiento único en mayor ({month})",
                     ]
-                    if bidx in unmatched_deb_idx:
-                        unmatched_deb_idx.remove(bidx)
-                decision_log.append(f"Matched as consolidated bank charges ({month}, {len(grp_idxs)} movimientos).")
-            elif len(candidates) > 1:
-                for bidx in grp_idxs:
-                    bank_df.loc[bidx, ["_match_type", "_match_reason"]] = [
-                        "multiple_possible_candidates",
-                        f"Multiple possible consolidated ledger candidates for {month}",
-                    ]
+                decision_log.append(f"Gastos/impuestos conciliados contra mayor ({month}, {len(grp_idxs)} movimientos).")
             else:
-                near = pool_haber[
-                    (~pool_haber["_used"])
-                    & (pool_haber["Fecha"].dt.to_period("M") == month)
-                    & ((pool_haber["Fecha"] - m_end).abs().dt.days <= eom_tol)
-                    & (abs(pool_haber["Haber"] - total_abs) <= cons_tol * 5)
-                ]
-                status = "ledger_entry_found_amount_difference" if len(near) > 0 else "ledger_entry_not_found"
+                reason = (
+                    f"Gastos/impuestos de {month} — sin asiento consolidado en mayor"
+                    if len(candidates) == 0
+                    else f"Gastos/impuestos de {month} — múltiples candidatos en mayor"
+                )
                 for bidx in grp_idxs:
-                    bank_df.loc[bidx, ["_match_type", "_match_reason"]] = [
-                        status,
-                        f"Consolidated charge candidate: {status} for {month}",
-                    ]
+                    bank_df.loc[bidx, "_match_reason"] = reason
 
     # PASS 3: Transferencias con tolerancia fecha + agrupación
     transfer_patterns = cfg.get("transfer_include_patterns", [])
@@ -392,6 +396,7 @@ def reconcile(
     # Construcción salida
     faltantes_cred = _build_df_from_indexes(bank_df, unmatched_cred_idx)
     faltantes_deb = _build_df_from_indexes(bank_df, unmatched_deb_idx)
+    gastos_impuestos_df = _build_df_from_indexes(bank_df, gastos_impuestos_idxs)
 
     mayor_sb_debe = pool_debe[~pool_debe["_used"]][["Fecha", "Descripcion", "Asiento", "Debe"]].copy()
     mayor_sb_haber = pool_haber[~pool_haber["_used"]][["Fecha", "Descripcion", "Asiento", "Haber"]].copy()
@@ -423,6 +428,7 @@ def reconcile(
         conciliados_debitos=int(((bank_df["Debito"] < 0) & (bank_df["_matched"])).sum()),
         faltantes_creditos=faltantes_cred,
         faltantes_debitos=faltantes_deb,
+        gastos_impuestos=gastos_impuestos_df,
         mayor_sin_banco_debe=mayor_sb_debe.reset_index(drop=True),
         mayor_sin_banco_haber=mayor_sb_haber.reset_index(drop=True),
         banco_completo=banco_completo,

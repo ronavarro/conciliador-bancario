@@ -118,10 +118,12 @@ def build_excel(result: ReconciliationResult, banco_nombre: str, periodo: str) -
     _hdr(ws[f"A{row}"], bg=C["dark_red"], size=11)
     ws.row_dimensions[row].height = 22
 
+    total_gi = result.monto_gastos_impuestos
     discrep = [
-        ("Créditos sin asiento en mayor",      len(result.faltantes_creditos), f"$ {total_cred:,.2f}", '→ Ver "Faltantes Créditos"'),
-        ("Débitos sin asiento en mayor",        len(result.faltantes_debitos),  f"$ {total_deb:,.2f}",  '→ Ver "Faltantes Débitos"'),
-        ("TOTAL faltantes",                     result.total_faltantes,          f"$ {total_cred + total_deb:,.2f}", ""),
+        ("Créditos sin asiento en mayor",      len(result.faltantes_creditos),   f"$ {total_cred:,.2f}",  '→ Ver "Faltantes Créditos"'),
+        ("Débitos sin asiento en mayor",        len(result.faltantes_debitos),    f"$ {total_deb:,.2f}",   '→ Ver "Faltantes Débitos"'),
+        ("TOTAL faltantes",                     result.total_faltantes,           f"$ {total_cred + total_deb:,.2f}", ""),
+        ("Gastos e impuestos bancarios",        len(result.gastos_impuestos),     f"$ {total_gi:,.2f}",    '→ Ver "Gastos e Impuestos"'),
     ]
     for d in discrep:
         row += 1
@@ -193,7 +195,63 @@ def build_excel(result: ReconciliationResult, banco_nombre: str, periodo: str) -
             _dat(ws3.cell(row=nxt3, column=c), bg=C["red_bg"], bold=True)
         ws3.cell(row=nxt3, column=4).number_format = "#,##0.00"
 
-    # ── HOJA 4: Mayor sin Banco ───────────────────────────────────────────
+    # ── HOJA 4: Gastos e Impuestos ────────────────────────────────────────
+    ws_gi = wb.create_sheet("Gastos e Impuestos")
+    for col, w in zip("ABCDE", [14, 50, 24, 18, 40]):
+        ws_gi.column_dimensions[col].width = w
+
+    ws_gi.merge_cells("A1:E1")
+    ws_gi["A1"] = f"GASTOS E IMPUESTOS BANCARIOS — {len(result.gastos_impuestos)} movimiento(s)"
+    ws_gi["A1"].font      = Font(name="Arial", bold=True, size=12, color="FFFFFF")
+    ws_gi["A1"].fill      = PatternFill("solid", fgColor="7030A0")
+    ws_gi["A1"].alignment = Alignment(horizontal="center", vertical="center")
+    ws_gi.row_dimensions[1].height = 25
+
+    if not result.gastos_impuestos.empty:
+        gi_df = result.gastos_impuestos.copy()
+        gi_df["_fecha_dt"] = pd.to_datetime(gi_df["Fecha"], dayfirst=True, errors="coerce")
+        gi_df["Mes"] = gi_df["_fecha_dt"].dt.to_period("M").astype(str)
+
+        # Resumen por mes
+        ws_gi.merge_cells("A2:E2")
+        ws_gi["A2"] = "RESUMEN POR MES"
+        _hdr(ws_gi["A2"], bg="7030A0", size=10)
+
+        resumen = (
+            gi_df.groupby("Mes")["Debito"]
+            .agg(Cantidad="count", Total="sum")
+            .reset_index()
+        )
+        resumen["Total"] = resumen["Total"].abs()
+        r_gi = _write_table(ws_gi, 3,
+            ["Mes", "Cantidad movimientos", "Total ($)"],
+            resumen, row_bg="EDE7F6", hdr_bg="7030A0", num_cols=[3])
+
+        # Total resumen
+        ws_gi.cell(row=r_gi, column=2, value="TOTAL")
+        ws_gi.cell(row=r_gi, column=3, value=resumen["Total"].sum())
+        ws_gi.cell(row=r_gi, column=3).number_format = "#,##0.00"
+        for c in range(1, 4):
+            _dat(ws_gi.cell(row=r_gi, column=c), bg="D1C4E9", bold=True)
+
+        r_gi += 2
+        ws_gi.merge_cells(f"A{r_gi}:E{r_gi}")
+        ws_gi[f"A{r_gi}"] = "DETALLE DE MOVIMIENTOS"
+        _hdr(ws_gi[f"A{r_gi}"], bg="7030A0", size=10)
+
+        gi_display = gi_df.drop(columns=["_fecha_dt", "Mes"], errors="ignore")
+        r_gi += 1
+        nxt_gi = _write_table(ws_gi, r_gi,
+            ["Fecha", "Concepto", "Comprobante", "Débito ($)", "Crédito ($)"],
+            gi_display, row_bg="EDE7F6", hdr_bg="7030A0", num_cols=[4, 5])
+
+        ws_gi.cell(row=nxt_gi, column=3, value="TOTAL")
+        ws_gi.cell(row=nxt_gi, column=4, value=result.monto_gastos_impuestos)
+        ws_gi.cell(row=nxt_gi, column=4).number_format = "#,##0.00"
+        for c in range(1, 6):
+            _dat(ws_gi.cell(row=nxt_gi, column=c), bg="D1C4E9", bold=True)
+
+    # ── HOJA 5: Mayor sin Banco ───────────────────────────────────────────
     ws4 = wb.create_sheet("Mayor sin Banco")
     for col, w in zip("ABCDE", [14, 52, 14, 18, 30]):
         ws4.column_dimensions[col].width = w

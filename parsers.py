@@ -45,6 +45,8 @@ def parse_bbva(file) -> pd.DataFrame:
     ]
     df["Debito"]  = pd.to_numeric(df["Debito"],  errors="coerce").fillna(0)
     df["Credito"] = pd.to_numeric(df["Credito"], errors="coerce").fillna(0)
+    # BBVA exporta débitos como valores positivos; el motor espera negativos
+    df["Debito"] = -df["Debito"].abs()
     return _clean_df(df)
 
 

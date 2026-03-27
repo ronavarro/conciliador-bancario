@@ -340,8 +340,9 @@ if run:
     st.markdown("<br>", unsafe_allow_html=True)
 
     # ── Tabs de detalle ────────────────────────────────────────────────────
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         f"🚨 Faltantes ({result.total_faltantes})",
+        f"🧾 Gastos e Impuestos ({len(result.gastos_impuestos)})",
         f"📋 Extracto completo ({result.banco_total})",
         f"📒 Mayor sin banco ({len(result.mayor_sin_banco_debe) + len(result.mayor_sin_banco_haber)})",
         "📥 Descargar",
@@ -368,6 +369,40 @@ if run:
                 st.caption(f"Total: **${result.monto_faltantes_debitos:,.2f}**")
 
     with tab2:
+        if result.gastos_impuestos.empty:
+            st.info("No se detectaron gastos e impuestos bancarios en este período.")
+        else:
+            total_gi = result.monto_gastos_impuestos
+            st.caption(
+                f"Estos movimientos fueron identificados por las reglas del banco "
+                f"({bank_name if 'bank_name' in dir() else banco}) y se excluyen de los faltantes."
+            )
+
+            # Resumen agrupado por mes
+            gi_df = result.gastos_impuestos.copy()
+            gi_df["_fecha_dt"] = pd.to_datetime(gi_df["Fecha"], dayfirst=True, errors="coerce")
+            gi_df["Mes"] = gi_df["_fecha_dt"].dt.to_period("M").astype(str)
+            resumen = (
+                gi_df.groupby("Mes")["Debito"]
+                .agg(Cantidad="count", Total="sum")
+                .reset_index()
+            )
+            resumen["Total"] = resumen["Total"].abs()
+            st.markdown('<div class="section-title">Resumen por mes</div>', unsafe_allow_html=True)
+            st.dataframe(
+                resumen.style.format({"Total": "${:,.2f}"}),
+                use_container_width=True, hide_index=True
+            )
+            st.caption(f"**Total período: ${total_gi:,.2f}**")
+
+            # Detalle completo
+            st.markdown('<div class="section-title">Detalle de movimientos</div>', unsafe_allow_html=True)
+            st.dataframe(
+                result.gastos_impuestos.style.format({"Debito": "${:,.2f}"}),
+                use_container_width=True, hide_index=True
+            )
+
+    with tab3:
         st.markdown('<div class="section-title">Todos los movimientos del extracto bancario</div>', unsafe_allow_html=True)
 
         def highlight_estado(row):
@@ -378,7 +413,7 @@ if run:
         styled = result.banco_completo.style.apply(highlight_estado, axis=1)
         st.dataframe(styled, use_container_width=True, hide_index=True)
 
-    with tab3:
+    with tab4:
         if result.mayor_sin_banco_debe.empty and result.mayor_sin_banco_haber.empty:
             st.success("✅ Todos los asientos del mayor tienen correspondencia en el banco.")
         else:
@@ -395,7 +430,7 @@ if run:
                     use_container_width=True, hide_index=True
                 )
 
-    with tab4:
+    with tab5:
         st.markdown('<div class="section-title">Exportar informe completo</div>', unsafe_allow_html=True)
         st.markdown("""
         El archivo Excel incluye:
