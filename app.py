@@ -6,7 +6,20 @@ Streamlit app — sube extracto + mayor, descargá el Excel conciliado.
 import streamlit as st
 import pandas as pd
 import io
+import base64
+from pathlib import Path
 from datetime import datetime
+
+
+def _img_b64(filename: str) -> str:
+    """Carga un archivo de imagen desde assets/ y lo devuelve como data URI base64."""
+    p = Path(__file__).parent / "assets" / filename
+    if not p.exists():
+        return ""
+    ext = p.suffix.lstrip(".").lower()
+    mime = "svg+xml" if ext == "svg" else ext
+    data = base64.b64encode(p.read_bytes()).decode()
+    return f"data:image/{mime};base64,{data}"
 
 from parsers import (
     BANK_PARSERS,
@@ -33,11 +46,15 @@ st.markdown("""
     font-family: 'DM Sans', sans-serif;
   }
 
+  /* Ocultar toolbar de Streamlit (Deploy, menú) */
+  [data-testid="stToolbar"] { display: none !important; }
+  [data-testid="stHeader"]  { display: none !important; }
+
   .main { background: #F7F8FC; }
 
   /* Header hero */
   .hero {
-    background: linear-gradient(135deg, #1A2B5F 0%, #0F4C81 60%, #1565C0 100%);
+    background: linear-gradient(to right, #1A2B5F 0%, #0F4C81 50%, #ffffff 100%);
     border-radius: 16px;
     padding: 40px 48px;
     margin-bottom: 32px;
@@ -63,6 +80,8 @@ st.markdown("""
   }
   .hero h1 { font-size: 2.2rem; font-weight: 600; margin: 0 0 8px 0; letter-spacing: -0.5px; }
   .hero p  { font-size: 1rem; opacity: 0.75; margin: 0; font-weight: 300; }
+  .hero-inner { display: flex; justify-content: space-between; align-items: center; }
+  .hero-logo img { height: 64px; object-fit: contain; }
 
   /* Upload cards */
   .upload-card {
@@ -186,22 +205,42 @@ st.markdown("""
 
 
 # ── Hero header ──────────────────────────────────────────────────────────────
-st.markdown("""
+_guantex_src = _img_b64("logo_guantex.png")
+_guantex_img = f'<div class="hero-logo"><img src="{_guantex_src}" alt="Guantex" /></div>' if _guantex_src else ""
+
+st.markdown(f"""
 <div class="hero">
-  <h1>🏦 Conciliador Bancario</h1>
-  <p>Subí el extracto del banco y el Mayor de Cuentas del ERP — el sistema valida cada movimiento automáticamente.</p>
+  <div class="hero-inner">
+    <div>
+      <h1>🏦 Conciliador Bancario</h1>
+      <p>Subí el extracto del banco y el Mayor de Cuentas del ERP — el sistema valida cada movimiento automáticamente.</p>
+    </div>
+    {_guantex_img}
+  </div>
 </div>
 """, unsafe_allow_html=True)
 
 
-# ── Upload section ───────────────────────────────────────────────────────────
+# ── Session state ─────────────────────────────────────────────────────────────
+if "upload_key" not in st.session_state:
+    st.session_state.upload_key = 0
+if "result" not in st.session_state:
+    st.session_state.result = None
+if "banco" not in st.session_state:
+    st.session_state.banco = None
+if "periodo" not in st.session_state:
+    st.session_state.periodo = None
+if "banco_icon" not in st.session_state:
+    st.session_state.banco_icon = "🏦"
+
+# ── Upload section ─────────────────────────────────────────────────────────────
 col1, col2 = st.columns(2, gap="large")
 
 with col1:
     st.markdown('<div class="upload-label">📄 Extracto Bancario</div>', unsafe_allow_html=True)
     bank_file = st.file_uploader(
         "Extracto del banco", type=["xls", "xlsx"],
-        key="bank", label_visibility="collapsed"
+        key=f"bank_{st.session_state.upload_key}", label_visibility="collapsed"
     )
     if bank_file:
         detected = detect_bank(bank_file)
@@ -215,7 +254,7 @@ with col2:
     st.markdown('<div class="upload-label">📊 Mayor de Cuentas (ERP)</div>', unsafe_allow_html=True)
     mayor_file = st.file_uploader(
         "Mayor de cuentas", type=["xlsx"],
-        key="mayor", label_visibility="collapsed"
+        key=f"mayor_{st.session_state.upload_key}", label_visibility="collapsed"
     )
     if mayor_file:
         st.markdown('<div class="bank-badge" style="background:#F0FDF4;color:#15803D;border-color:#BBF7D0;">✓ Archivo cargado</div>', unsafe_allow_html=True)
@@ -240,42 +279,52 @@ periodo_input = st.text_input(
 st.markdown("<br>", unsafe_allow_html=True)
 run_col, _ = st.columns([1, 2])
 with run_col:
-    run = st.button("▶  Ejecutar Conciliación", use_container_width=True)
+    if st.session_state.result is not None:
+        if st.button("↩  Volver a cargar archivos", use_container_width=True):
+            st.session_state.result = None
+            st.session_state.banco = None
+            st.session_state.periodo = None
+            st.session_state.banco_icon = "🏦"
+            st.session_state.upload_key += 1
+            st.rerun()
+    else:
+        if st.button("▶  Ejecutar Conciliación", use_container_width=True):
+            if not bank_file or not mayor_file:
+                st.markdown('<div class="alert alert-error">⚠ Necesitás subir ambos archivos antes de ejecutar.</div>', unsafe_allow_html=True)
+                st.stop()
 
-# ── Procesamiento ─────────────────────────────────────────────────────────────
-if run:
-    if not bank_file or not mayor_file:
-        st.markdown('<div class="alert alert-error">⚠ Necesitás subir ambos archivos antes de ejecutar.</div>', unsafe_allow_html=True)
-        st.stop()
-
-    # Detectar banco
-    bank_file.seek(0)
-    banco = detect_bank(bank_file) or banco_manual
-    if not banco:
-        st.error("No se pudo identificar el banco. Seleccionalo manualmente.")
-        st.stop()
-
-    banco_icon = {"BBVA": "🟦", "BNA": "🟩", "Macro": "🟧", "Santander": "🟥"}.get(banco, "🏦")
-
-    with st.spinner("Procesando..."):
-        try:
             bank_file.seek(0)
-            bank_df  = BANK_PARSERS[banco](bank_file)
-            mayor_df = parse_mayor(mayor_file)
-            result   = reconcile(
-                bank_df,
-                mayor_df,
-                banco=banco,
-            )
+            _banco = detect_bank(bank_file) or banco_manual
+            if not _banco:
+                st.error("No se pudo identificar el banco. Seleccionalo manualmente.")
+                st.stop()
 
-            periodo = periodo_input.strip() or (
-                f"{bank_df['Fecha'].min().strftime('%d/%m/%Y')} — {bank_df['Fecha'].max().strftime('%d/%m/%Y')}"
-                if not bank_df.empty else "—"
-            )
+            with st.spinner("Procesando..."):
+                try:
+                    bank_file.seek(0)
+                    bank_df  = BANK_PARSERS[_banco](bank_file)
+                    mayor_df = parse_mayor(mayor_file)
+                    _result  = reconcile(bank_df, mayor_df, banco=_banco)
+                    _periodo = periodo_input.strip() or (
+                        f"{bank_df['Fecha'].min().strftime('%d/%m/%Y')} — {bank_df['Fecha'].max().strftime('%d/%m/%Y')}"
+                        if not bank_df.empty else "—"
+                    )
+                except Exception as e:
+                    st.error(f"Error al procesar los archivos: {e}")
+                    st.stop()
 
-        except Exception as e:
-            st.error(f"Error al procesar los archivos: {e}")
-            st.stop()
+            st.session_state.result     = _result
+            st.session_state.banco      = _banco
+            st.session_state.periodo    = _periodo
+            st.session_state.banco_icon = {"BBVA": "🟦", "BNA": "🟩", "Macro": "🟧", "Santander": "🟥"}.get(_banco, "🏦")
+            st.rerun()
+
+# ── Resultado (desde session state) ───────────────────────────────────────────
+if st.session_state.result is not None:
+    result     = st.session_state.result
+    banco      = st.session_state.banco
+    periodo    = st.session_state.periodo
+    banco_icon = st.session_state.banco_icon
 
     # ── Banner de resultado ────────────────────────────────────────────────
     if result.total_faltantes == 0:
@@ -440,8 +489,12 @@ if run:
             for line in result.decision_log:
                 st.write(f"- {line}")
 
-st.markdown("""
+_ascent_src = _img_b64("logo_ascent.png")
+_ascent_img = f'<br/><img src="{_ascent_src}" alt="Ascent Advisors" style="height:56px; object-fit:contain; margin-top:12px; opacity:0.65;" />' if _ascent_src else ""
+
+st.markdown(f"""
 <div class="footer">
-  Conciliador Bancario · Soporta BBVA, BNA, Macro, Santander
+  Conciliador Bancario · Ascent Consulting
+  {_ascent_img}
 </div>
 """, unsafe_allow_html=True)
