@@ -20,6 +20,11 @@ DEFAULT_RECONCILIATION_CONFIG = {
                 "gp-com.trans", "gp-cable tra", "gp-gastos ou", "gp-iva tasa",
                 "gp-percep.iv", "comi. transf", "cje. interno", "ch/clear.48",
                 "oper. fdo.co",
+                # desde gastos_bancarios.csv:
+                "impuesto ley", "com.transf comision", "iva tasa gra", "comision tra",
+                "gp-comision cumpl impo", "percepcion i", "comision ext efectivo",
+                "gp-comision altseg despacho", "iva tasa red", "ley nro 25.4",
+                "comision ges", "com.transfer comision", "comision man", "comision mov",
             ],
             "exclude_patterns": ["transferencia", "cheque", "fondo comun", "afip"],
         },
@@ -29,16 +34,15 @@ DEFAULT_RECONCILIATION_CONFIG = {
                 # desde el Excel:
                 "gravamen ley", "reg.rec.sircreb", "reten. i.v.a.", "debito automatico",
                 "reintegro ley", "com transfe electronica", "comis. canje",
-                # nuevos patrones detectados en extracto:
-                "i.b.reg re",    # Ingresos Brutos Régimen General
-                "co.trf.ele",    # Comisión Transferencia Electrónica
-                "debitos",       # Débitos varios bancarios
-                "ch/recib48",    # Cheque/Recibo 48hs
-                "pgo.t/cred",    # Pago tarjeta crédito
-                "trf.red",       # Transferencia Red
-                "abono interpyme",  # Abono Red Interpyme
-                "deb.aut.se",    # Débito automático servicios
-                "ch/de inte",    # Cheque de intereses
+                # detectados en extracto:
+                "i.b.reg re", "co.trf.ele", "debitos", "ch/recib48", "pgo.t/cred",
+                "trf.red", "abono interpyme", "deb.aut.se", "ch/de inte",
+                # desde gastos_bancarios.csv:
+                "gravamen ley 25413 s/deb", "gravamen ley 25413 s/cred",
+                "comision paquetes", "i.v.a. base", "reten. i.v.a. rg.2408",
+                "comision deb. transf. ibk", "comis. canje o/bancos",
+                "reintegro ley 25413/deb", "comis. gasto chequera",
+                "com.ch clearing o aplic.a",
             ],
             "exclude_patterns": ["transferencia", "cheque", "fondo comun", "afip"],
         },
@@ -47,6 +51,8 @@ DEFAULT_RECONCILIATION_CONFIG = {
                 "comision", "iva", "impuesto", "cargo", "interes", "sellos", "debito",
                 # desde el Excel:
                 "rrsircreb", "com.serv",
+                # desde gastos_bancarios.csv:
+                "impuesto al debito", "impuesto al credito", "iva 21%",
             ],
             "exclude_patterns": ["transferencia", "cheque", "fondo comun", "afip"],
         },
@@ -55,6 +61,8 @@ DEFAULT_RECONCILIATION_CONFIG = {
                 "comision", "iva", "impuesto", "cargo", "interes", "sellos", "gasto bancario",
                 # desde el Excel:
                 "rrsircreb", "co.trf.ele", "com.v/cob", "iva percep", "a/mant.c.a",
+                # desde gastos_bancarios.csv:
+                "impuesto al debito", "impuesto al credito", "impuestos",
             ],
             "exclude_patterns": ["transferencia", "cheque", "fondo comun", "afip"],
         },

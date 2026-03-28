@@ -12,8 +12,6 @@ from parsers import (
     BANK_PARSERS,
     detect_bank,
     parse_mayor,
-    parse_supplier_table,
-    parse_cheques_aux,
 )
 from engine  import reconcile
 from exporter import build_excel
@@ -222,16 +220,6 @@ with col2:
     if mayor_file:
         st.markdown('<div class="bank-badge" style="background:#F0FDF4;color:#15803D;border-color:#BBF7D0;">✓ Archivo cargado</div>', unsafe_allow_html=True)
 
-aux1, aux2 = st.columns(2)
-with aux1:
-    supplier_file = st.file_uploader(
-        "Tabla proveedores (opcional)", type=["xls", "xlsx"], key="suppliers"
-    )
-with aux2:
-    cheque_file = st.file_uploader(
-        "Auxiliar cheques emitidos (opcional)", type=["xls", "xlsx"], key="cheques"
-    )
-
 # Selector manual de banco (por si la detección falla)
 banco_manual = None
 if bank_file and not detect_bank(bank_file):
@@ -274,14 +262,10 @@ if run:
             bank_file.seek(0)
             bank_df  = BANK_PARSERS[banco](bank_file)
             mayor_df = parse_mayor(mayor_file)
-            supplier_df = parse_supplier_table(supplier_file) if supplier_file else None
-            cheques_df = parse_cheques_aux(cheque_file) if cheque_file else None
             result   = reconcile(
                 bank_df,
                 mayor_df,
                 banco=banco,
-                supplier_df=supplier_df,
-                cheques_df=cheques_df,
             )
 
             periodo = periodo_input.strip() or (
