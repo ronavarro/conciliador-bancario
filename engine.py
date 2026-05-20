@@ -16,6 +16,7 @@ Sobre esta base se agregan pases incrementales configurables para casos especial
 
 from __future__ import annotations
 import re
+import unicodedata
 from dataclasses import dataclass, field
 
 import pandas as pd
@@ -44,8 +45,17 @@ class ReconciliationResult:
     # Banco completo con estado
     banco_completo: pd.DataFrame = field(default_factory=pd.DataFrame)
 
+    # Mayor completo con estado (conciliado / sin conciliar / descartado)
+    mayor_completo: pd.DataFrame = field(default_factory=pd.DataFrame)
+
+    # Sugerencias de conciliación: faltantes con candidatos en el mayor a distinta fecha (±5%)
+    sugerencias_conciliacion: pd.DataFrame = field(default_factory=pd.DataFrame)
+
     # Gastos e impuestos bancarios (separados de faltantes)
     gastos_impuestos: pd.DataFrame = field(default_factory=pd.DataFrame)
+
+    # Conceptos especiales (movimientos entre cuentas, FCI, etc.) — revisión manual
+    conceptos_especiales: pd.DataFrame = field(default_factory=pd.DataFrame)
 
     # Trazabilidad
     decision_log: list[str] = field(default_factory=list)
@@ -65,6 +75,17 @@ class ReconciliationResult:
     @property
     def monto_gastos_impuestos(self):
         return self.gastos_impuestos["Debito"].abs().sum() if not self.gastos_impuestos.empty else 0
+
+    @property
+    def monto_conceptos_especiales(self):
+        if self.conceptos_especiales.empty:
+            return 0
+        total = 0
+        if "Debito" in self.conceptos_especiales.columns:
+            total += self.conceptos_especiales["Debito"].abs().sum()
+        if "Credito" in self.conceptos_especiales.columns:
+            total += self.conceptos_especiales["Credito"].abs().sum()
+        return total
 
     @property
     def pct_conciliado(self):
@@ -102,6 +123,11 @@ def _bank_charge_candidate(text: str, include: list[str], exclude: list[str], fu
     if any(pat in tx for pat in fund_patterns):
         return False
     return any(pat in tx for pat in include)
+
+
+def _is_special_concept(text: str, special_patterns: list[str]) -> bool:
+    tx = _norm_text(text)
+    return any(pat in tx for pat in special_patterns)
 
 
 def _build_df_from_indexes(bank_df: pd.DataFrame, idxs: list[int]) -> pd.DataFrame:
@@ -142,6 +168,19 @@ def reconcile(
     # Pools separados: Debe (ingresos al banco) y Haber (egresos del banco)
     pool_debe = mayor_df[mayor_df["Debe"] > 0][["Fecha", "Descripcion", "Debe", "Asiento"]].copy().reset_index(drop=True)
     pool_haber = mayor_df[mayor_df["Haber"] > 0][["Fecha", "Descripcion", "Haber", "Asiento"]].copy().reset_index(drop=True)
+
+    # Excluir del Debe conceptos que no deben conciliarse ni aparecer en "Mayor sin banco"
+    debe_ignore = cfg.get("mayor_debe_ignore_patterns", [])
+    mayor_debe_descartados: pd.DataFrame = pd.DataFrame(columns=["Fecha", "Descripcion", "Asiento", "Debe"])
+    if debe_ignore:
+        def _norm(s: str) -> str:
+            return unicodedata.normalize("NFD", str(s).lower()).encode("ascii", "ignore").decode()
+        normed_ignore = [_norm(p) for p in debe_ignore]
+        mask_ignore = pool_debe["Descripcion"].apply(
+            lambda d: any(p in _norm(d) for p in normed_ignore)
+        )
+        mayor_debe_descartados = pool_debe[mask_ignore][["Fecha", "Descripcion", "Asiento", "Debe"]].copy()
+        pool_debe = pool_debe[~mask_ignore].reset_index(drop=True)
     pool_debe["_used"] = False
     pool_haber["_used"] = False
 
@@ -190,9 +229,28 @@ def reconcile(
         else:
             unmatched_deb_idx.append(int(row["_idx"]))
 
-    # PASS 2: Cargos bancarios — gastos e impuestos
+    # PASS 2: Conceptos Especiales — movimientos entre cuentas, FCI, etc. (revisión manual)
     bank_name = banco or ""
     rules = cfg.get("bank_rules", {}).get(bank_name, {})
+    special_patterns = rules.get("special_patterns", [])
+
+    conceptos_especiales_idxs: list[int] = []
+    if special_patterns:
+        for bidx in list(unmatched_deb_idx + unmatched_cred_idx):
+            if bank_df.loc[bidx, "_matched"]:
+                continue
+            if _is_special_concept(bank_df.loc[bidx, "Concepto"], special_patterns):
+                conceptos_especiales_idxs.append(bidx)
+                bank_df.loc[bidx, ["_match_type", "_match_reason"]] = [
+                    "conceptos_especiales",
+                    "Concepto especial (movimiento entre cuentas / operación FCI) — requiere revisión manual",
+                ]
+                if bidx in unmatched_deb_idx:
+                    unmatched_deb_idx.remove(bidx)
+                if bidx in unmatched_cred_idx:
+                    unmatched_cred_idx.remove(bidx)
+
+    # PASS 3: Cargos bancarios — gastos e impuestos
     include_patterns = rules.get("include_patterns", [])
     exclude_patterns = rules.get("exclude_patterns", [])
     fund_patterns = cfg.get("fund_patterns", [])
@@ -248,7 +306,7 @@ def reconcile(
                 for bidx in grp_idxs:
                     bank_df.loc[bidx, "_match_reason"] = reason
 
-    # PASS 3: Transferencias con tolerancia fecha + agrupación
+    # PASS 4: Transferencias con tolerancia fecha + agrupación
     transfer_patterns = cfg.get("transfer_include_patterns", [])
     transfer_tol_days = int(cfg.get("transfer_date_tolerance_days", 3))
 
@@ -338,7 +396,7 @@ def reconcile(
             "Transfer candidate found but not enough confidence to auto-match",
         ]
 
-    # PASS 4: Cheques de períodos previos (si hay archivo auxiliar)
+    # PASS 5: Cheques de períodos previos (si hay archivo auxiliar)
     cheque_patterns = cfg.get("cheque_patterns", [])
     if cheques_df is not None and not cheques_df.empty:
         for bidx in list(unmatched_deb_idx):
@@ -365,7 +423,7 @@ def reconcile(
             unmatched_deb_idx.remove(bidx)
             decision_log.append("Matched cheque issued in previous period.")
 
-    # PASS 5: Enriquecimiento opcional por CUIT/proveedor
+    # PASS 6: Enriquecimiento opcional por CUIT/proveedor
     if supplier_df is not None and not supplier_df.empty:
         for bidx in unmatched_deb_idx + unmatched_cred_idx:
             row = bank_df.loc[bidx]
@@ -382,7 +440,8 @@ def reconcile(
             add = f"CUIT matched with supplier table: {names or cuit}"
             bank_df.loc[bidx, "_match_reason"] = f"{prev_reason} | {add}" if prev_reason else add
 
-    # PASS 6: Detección fondos comunes — no clasificar como cargos
+    # PASS 7: Detección fondos comunes — no clasificar como cargos
+
     for bidx in unmatched_deb_idx + unmatched_cred_idx:
         if bank_df.loc[bidx, "_matched"]:
             continue
@@ -397,11 +456,40 @@ def reconcile(
     faltantes_cred = _build_df_from_indexes(bank_df, unmatched_cred_idx)
     faltantes_deb = _build_df_from_indexes(bank_df, unmatched_deb_idx)
     gastos_impuestos_df = _build_df_from_indexes(bank_df, gastos_impuestos_idxs)
+    conceptos_especiales_df = _build_df_from_indexes(bank_df, conceptos_especiales_idxs)
 
     mayor_sb_debe = pool_debe[~pool_debe["_used"]][["Fecha", "Descripcion", "Asiento", "Debe"]].copy()
     mayor_sb_haber = pool_haber[~pool_haber["_used"]][["Fecha", "Descripcion", "Asiento", "Haber"]].copy()
     for df in [mayor_sb_debe, mayor_sb_haber]:
         df["Fecha"] = pd.to_datetime(df["Fecha"]).dt.strftime("%d/%m/%Y")
+
+    # Mayor completo: todas las filas de los pools con su estado
+    _mc_parts = []
+    for _df, _col, _estado_val in [
+        (pool_debe[pool_debe["_used"]],   "Debe",  "✓ Conciliado"),
+        (pool_debe[~pool_debe["_used"]],  "Debe",  "⚠ Sin conciliar"),
+        (pool_haber[pool_haber["_used"]], "Haber", "✓ Conciliado"),
+        (pool_haber[~pool_haber["_used"]],"Haber", "⚠ Sin conciliar"),
+    ]:
+        _part = _df[["Fecha", "Descripcion", "Asiento", _col]].copy()
+        _part.rename(columns={_col: "Importe"}, inplace=True)
+        _part["Tipo"] = _col
+        _part["Estado"] = _estado_val
+        _mc_parts.append(_part)
+
+    if not mayor_debe_descartados.empty:
+        _desc = mayor_debe_descartados[["Fecha", "Descripcion", "Asiento", "Debe"]].copy()
+        _desc.rename(columns={"Debe": "Importe"}, inplace=True)
+        _desc["Tipo"] = "Debe"
+        _desc["Estado"] = "— Descartado"
+        _mc_parts.append(_desc)
+
+    mayor_completo = pd.concat(_mc_parts, ignore_index=True) if _mc_parts else pd.DataFrame()
+    if not mayor_completo.empty:
+        mayor_completo["_sort"] = pd.to_datetime(mayor_completo["Fecha"], errors="coerce")
+        mayor_completo = mayor_completo.sort_values("_sort").drop(columns=["_sort"])
+        mayor_completo["Fecha"] = pd.to_datetime(mayor_completo["Fecha"], errors="coerce").dt.strftime("%d/%m/%Y")
+        mayor_completo = mayor_completo[["Fecha", "Tipo", "Descripcion", "Asiento", "Importe", "Estado"]].reset_index(drop=True)
 
     banco_completo = bank_df.copy()
 
@@ -418,6 +506,42 @@ def reconcile(
     banco_completo["Fecha"] = banco_completo["Fecha"].dt.strftime("%d/%m/%Y")
     banco_completo = banco_completo.drop(columns=["_idx", "_matched", "_match_type", "_match_reason"], errors="ignore")
 
+    # Sugerencias: para cada faltante buscar en el mayor sin banco un importe similar (±5%) en fecha distinta
+    _sug_rows = []
+    _tol_pct = 0.05
+
+    def _buscar_sugerencias(faltantes_df, importe_col, mayor_df_part, mayor_importe_col, tipo_label):
+        for _, falt in faltantes_df.iterrows():
+            amt = falt[importe_col]
+            if importe_col == "Debito":
+                amt = abs(amt)
+            if amt <= 0:
+                continue
+            for _, m in mayor_df_part.iterrows():
+                m_amt = m[mayor_importe_col]
+                if m_amt <= 0:
+                    continue
+                if abs(m_amt - amt) / amt <= _tol_pct and m["Fecha"] != falt["Fecha"]:
+                    _sug_rows.append({
+                        "Faltante Fecha":    falt["Fecha"],
+                        "Faltante Tipo":     tipo_label,
+                        "Faltante Concepto": falt.get("Concepto", ""),
+                        "Faltante Importe":  amt,
+                        "Mayor Fecha":       m["Fecha"],
+                        "Mayor Descripcion": m["Descripcion"],
+                        "Mayor Asiento":     m["Asiento"],
+                        "Mayor Importe":     m_amt,
+                        "Diferencia %":      round(abs(m_amt - amt) / amt * 100, 2),
+                    })
+
+    _buscar_sugerencias(faltantes_cred, "Credito", mayor_sb_debe,  "Debe",  "Crédito")
+    _buscar_sugerencias(faltantes_deb,  "Debito",  mayor_sb_haber, "Haber", "Débito")
+
+    sugerencias_df = pd.DataFrame(_sug_rows) if _sug_rows else pd.DataFrame(
+        columns=["Faltante Fecha","Faltante Tipo","Faltante Concepto","Faltante Importe",
+                 "Mayor Fecha","Mayor Descripcion","Mayor Asiento","Mayor Importe","Diferencia %"]
+    )
+
     return ReconciliationResult(
         banco_total=len(bank_df),
         banco_creditos=len(bank_cred),
@@ -429,8 +553,11 @@ def reconcile(
         faltantes_creditos=faltantes_cred,
         faltantes_debitos=faltantes_deb,
         gastos_impuestos=gastos_impuestos_df,
+        conceptos_especiales=conceptos_especiales_df,
         mayor_sin_banco_debe=mayor_sb_debe.reset_index(drop=True),
         mayor_sin_banco_haber=mayor_sb_haber.reset_index(drop=True),
         banco_completo=banco_completo,
+        mayor_completo=mayor_completo,
+        sugerencias_conciliacion=sugerencias_df,
         decision_log=decision_log,
     )

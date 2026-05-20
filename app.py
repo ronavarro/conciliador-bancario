@@ -205,17 +205,13 @@ st.markdown("""
 
 
 # ── Hero header ──────────────────────────────────────────────────────────────
-_guantex_src = _img_b64("logo_guantex.png")
-_guantex_img = f'<div class="hero-logo"><img src="{_guantex_src}" alt="Guantex" /></div>' if _guantex_src else ""
-
-st.markdown(f"""
+st.markdown("""
 <div class="hero">
   <div class="hero-inner">
     <div>
       <h1>🏦 Conciliador Bancario</h1>
       <p>Subí el extracto del banco y el Mayor de Cuentas del ERP — el sistema valida cada movimiento automáticamente.</p>
     </div>
-    {_guantex_img}
   </div>
 </div>
 """, unsafe_allow_html=True)
@@ -253,7 +249,7 @@ with col1:
 with col2:
     st.markdown('<div class="upload-label">📊 Mayor de Cuentas (ERP)</div>', unsafe_allow_html=True)
     mayor_file = st.file_uploader(
-        "Mayor de cuentas", type=["xlsx"],
+        "Mayor de cuentas", type=["xls", "xlsx"],
         key=f"mayor_{st.session_state.upload_key}", label_visibility="collapsed"
     )
     if mayor_file:
@@ -373,11 +369,13 @@ if st.session_state.result is not None:
     st.markdown("<br>", unsafe_allow_html=True)
 
     # ── Tabs de detalle ────────────────────────────────────────────────────
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         f"🚨 Faltantes ({result.total_faltantes})",
         f"🧾 Gastos e Impuestos ({len(result.gastos_impuestos)})",
+        f"🔍 Conceptos Especiales ({len(result.conceptos_especiales)})",
         f"📋 Extracto completo ({result.banco_total})",
         f"📒 Mayor sin banco ({len(result.mayor_sin_banco_debe) + len(result.mayor_sin_banco_haber)})",
+        f"📗 Mayor completo ({len(result.mayor_completo)})",
         "📥 Descargar",
     ])
 
@@ -400,6 +398,24 @@ if st.session_state.result is not None:
                     use_container_width=True, hide_index=True
                 )
                 st.caption(f"Total: **${result.monto_faltantes_debitos:,.2f}**")
+
+        if not result.sugerencias_conciliacion.empty:
+            st.markdown("---")
+            st.markdown('<div class="section-title">💡 Sugerencias de conciliación</div>', unsafe_allow_html=True)
+            st.caption(
+                "Estos faltantes tienen un importe igual o muy cercano (±5%) a un asiento en el mayor "
+                "que todavía no fue conciliado, pero en una **fecha distinta**. "
+                "No son conciliaciones automáticas — requieren revisión manual."
+            )
+            sug_fmt = {
+                "Faltante Importe": "${:,.2f}",
+                "Mayor Importe":    "${:,.2f}",
+                "Diferencia %":     "{:.2f}%",
+            }
+            st.dataframe(
+                result.sugerencias_conciliacion.style.format(sug_fmt),
+                use_container_width=True, hide_index=True,
+            )
 
     with tab2:
         if result.gastos_impuestos.empty:
@@ -436,6 +452,28 @@ if st.session_state.result is not None:
             )
 
     with tab3:
+        if result.conceptos_especiales.empty:
+            st.info("No se detectaron conceptos especiales en este período.")
+        else:
+            st.caption(
+                "Estos movimientos corresponden a operaciones entre cuentas, fondos comunes de inversión u "
+                "otras operaciones especiales. No se concilian automáticamente contra el mayor — "
+                "**requieren revisión manual**."
+            )
+            ce_df = result.conceptos_especiales.copy()
+            fmt = {}
+            if "Debito" in ce_df.columns:
+                fmt["Debito"] = "${:,.2f}"
+            if "Credito" in ce_df.columns:
+                fmt["Credito"] = "${:,.2f}"
+            st.markdown('<div class="section-title">Detalle de movimientos</div>', unsafe_allow_html=True)
+            st.dataframe(
+                ce_df.style.format(fmt),
+                use_container_width=True, hide_index=True
+            )
+            st.caption(f"**Total período: ${result.monto_conceptos_especiales:,.2f}**")
+
+    with tab4:
         st.markdown('<div class="section-title">Todos los movimientos del extracto bancario</div>', unsafe_allow_html=True)
 
         def highlight_estado(row):
@@ -443,10 +481,14 @@ if st.session_state.result is not None:
                 return ["background-color: #FEF2F2"] * len(row)
             return ["background-color: #F0FDF4" if i % 2 == 0 else "" for i in range(len(row))]
 
-        styled = result.banco_completo.style.apply(highlight_estado, axis=1)
+        styled = (
+            result.banco_completo.style
+            .apply(highlight_estado, axis=1)
+            .format({"Credito": "${:,.2f}", "Debito": "${:,.2f}", "Importe": "${:,.2f}"}, na_rep="")
+        )
         st.dataframe(styled, use_container_width=True, hide_index=True)
 
-    with tab4:
+    with tab5:
         if result.mayor_sin_banco_debe.empty and result.mayor_sin_banco_haber.empty:
             st.success("✅ Todos los asientos del mayor tienen correspondencia en el banco.")
         else:
@@ -463,12 +505,36 @@ if st.session_state.result is not None:
                     use_container_width=True, hide_index=True
                 )
 
-    with tab5:
+    with tab6:
+        st.markdown('<div class="section-title">Todos los asientos del Mayor de Cuentas</div>', unsafe_allow_html=True)
+
+        def highlight_mayor(row):
+            estado = row.get("Estado", "")
+            if estado == "✓ Conciliado":
+                return ["background-color: #F0FDF4"] * len(row)
+            if estado == "⚠ Sin conciliar":
+                return ["background-color: #FEF2F2"] * len(row)
+            if estado == "— Descartado":
+                return ["background-color: #F9FAFB; color: #9CA3AF"] * len(row)
+            return [""] * len(row)
+
+        if result.mayor_completo.empty:
+            st.info("No hay asientos en el mayor para este período.")
+        else:
+            styled_mc = (
+                result.mayor_completo.style
+                .apply(highlight_mayor, axis=1)
+                .format({"Importe": "${:,.2f}"}, na_rep="")
+            )
+            st.dataframe(styled_mc, use_container_width=True, hide_index=True)
+
+    with tab7:
         st.markdown('<div class="section-title">Exportar informe completo</div>', unsafe_allow_html=True)
         st.markdown("""
         El archivo Excel incluye:
         - **Resumen ejecutivo** con KPIs y estado general
         - **Faltantes Créditos** y **Faltantes Débitos** destacados
+        - **Conceptos Especiales** — operaciones que requieren revisión manual
         - **Mayor sin Banco** — asientos que están en el sistema pero no en el extracto
         - **Extracto Completo** con cada movimiento marcado como conciliado o faltante
         """)

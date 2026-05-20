@@ -4,6 +4,11 @@ from __future__ import annotations
 
 DEFAULT_RECONCILIATION_CONFIG = {
     "amount_tolerance": 0.02,
+    # Conceptos del mayor que, cuando tienen valor en Debe, deben ignorarse por completo
+    # (no se concilian ni aparecen en "Mayor sin banco").
+    "mayor_debe_ignore_patterns": [
+        "acreditacion de cheques propios",
+    ],
     "consolidated_amount_tolerance": 1.0,
     "transfer_date_tolerance_days": 3,
     "end_of_month_tolerance_days": 5,
@@ -18,8 +23,7 @@ DEFAULT_RECONCILIATION_CONFIG = {
                 # desde el Excel:
                 "sellado", "int.cob.acue", "reg rec sirc", "gp-comision",
                 "gp-com.trans", "gp-cable tra", "gp-gastos ou", "gp-iva tasa",
-                "gp-percep.iv", "comi. transf", "cje. interno", "ch/clear.48",
-                "oper. fdo.co",
+                "gp-percep.iv", "comi. transf", "ch/clear.48",
                 # desde gastos_bancarios.csv:
                 "impuesto ley", "com.transf comision", "iva tasa gra", "comision tra",
                 "gp-comision cumpl impo", "percepcion i", "comision ext efectivo",
@@ -27,6 +31,11 @@ DEFAULT_RECONCILIATION_CONFIG = {
                 "comision ges", "com.transfer comision", "comision man", "comision mov",
             ],
             "exclude_patterns": ["transferencia", "cheque", "fondo comun", "afip"],
+            "special_patterns": [
+                # Movimientos entre cuentas / fondos comunes de inversión — revisión manual
+                "cje. interno",
+                "oper. fdo.co",
+            ],
         },
         "BNA": {
             "include_patterns": [
@@ -36,7 +45,7 @@ DEFAULT_RECONCILIATION_CONFIG = {
                 "reintegro ley", "com transfe electronica", "comis. canje",
                 # detectados en extracto:
                 "i.b.reg re", "co.trf.ele", "debitos", "ch/recib48", "pgo.t/cred",
-                "trf.red", "abono interpyme", "deb.aut.se", "ch/de inte",
+                "trf.red", "deb.aut.se", "ch/de inte",
                 # desde gastos_bancarios.csv:
                 "gravamen ley 25413 s/deb", "gravamen ley 25413 s/cred",
                 "comision paquetes", "i.v.a. base", "reten. i.v.a. rg.2408",
@@ -45,6 +54,10 @@ DEFAULT_RECONCILIATION_CONFIG = {
                 "com.ch clearing o aplic.a",
             ],
             "exclude_patterns": ["transferencia", "cheque", "fondo comun", "afip"],
+            "special_patterns": [
+                # Movimientos entre cuentas / operaciones especiales — revisión manual
+                "abono interpyme",
+            ],
         },
         "Macro": {
             "include_patterns": [

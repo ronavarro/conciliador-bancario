@@ -118,12 +118,14 @@ def build_excel(result: ReconciliationResult, banco_nombre: str, periodo: str) -
     _hdr(ws[f"A{row}"], bg=C["dark_red"], size=11)
     ws.row_dimensions[row].height = 22
 
-    total_gi = result.monto_gastos_impuestos
+    total_gi  = result.monto_gastos_impuestos
+    total_ce  = result.monto_conceptos_especiales
     discrep = [
-        ("Créditos sin asiento en mayor",      len(result.faltantes_creditos),   f"$ {total_cred:,.2f}",  '→ Ver "Faltantes Créditos"'),
-        ("Débitos sin asiento en mayor",        len(result.faltantes_debitos),    f"$ {total_deb:,.2f}",   '→ Ver "Faltantes Débitos"'),
-        ("TOTAL faltantes",                     result.total_faltantes,           f"$ {total_cred + total_deb:,.2f}", ""),
-        ("Gastos e impuestos bancarios",        len(result.gastos_impuestos),     f"$ {total_gi:,.2f}",    '→ Ver "Gastos e Impuestos"'),
+        ("Créditos sin asiento en mayor",       len(result.faltantes_creditos),         f"$ {total_cred:,.2f}",  '→ Ver "Faltantes Créditos"'),
+        ("Débitos sin asiento en mayor",         len(result.faltantes_debitos),          f"$ {total_deb:,.2f}",   '→ Ver "Faltantes Débitos"'),
+        ("TOTAL faltantes",                      result.total_faltantes,                 f"$ {total_cred + total_deb:,.2f}", ""),
+        ("Gastos e impuestos bancarios",         len(result.gastos_impuestos),           f"$ {total_gi:,.2f}",    '→ Ver "Gastos e Impuestos"'),
+        ("Conceptos Especiales (rev. manual)",   len(result.conceptos_especiales),       f"$ {total_ce:,.2f}",    '→ Ver "Conceptos Especiales"'),
     ]
     for d in discrep:
         row += 1
@@ -251,7 +253,40 @@ def build_excel(result: ReconciliationResult, banco_nombre: str, periodo: str) -
         for c in range(1, 6):
             _dat(ws_gi.cell(row=nxt_gi, column=c), bg="D1C4E9", bold=True)
 
-    # ── HOJA 5: Mayor sin Banco ───────────────────────────────────────────
+    # ── HOJA 5: Conceptos Especiales ─────────────────────────────────────
+    ws_ce = wb.create_sheet("Conceptos Especiales")
+    for col, w in zip("ABCDE", [14, 50, 24, 18, 18]):
+        ws_ce.column_dimensions[col].width = w
+
+    ws_ce.merge_cells("A1:E1")
+    ws_ce["A1"] = f"CONCEPTOS ESPECIALES — {len(result.conceptos_especiales)} movimiento(s) — REVISIÓN MANUAL REQUERIDA"
+    ws_ce["A1"].font      = Font(name="Arial", bold=True, size=12, color="FFFFFF")
+    ws_ce["A1"].fill      = PatternFill("solid", fgColor="B45309")
+    ws_ce["A1"].alignment = Alignment(horizontal="center", vertical="center")
+    ws_ce.row_dimensions[1].height = 25
+
+    ws_ce.merge_cells("A2:E2")
+    ws_ce["A2"] = (
+        "Movimientos entre cuentas, operaciones con fondos comunes de inversión u otras operaciones especiales. "
+        "No se concilian automáticamente contra el mayor."
+    )
+    ws_ce["A2"].font      = Font(name="Arial", italic=True, size=9, color="7C2D12")
+    ws_ce["A2"].fill      = PatternFill("solid", fgColor="FEF3C7")
+    ws_ce["A2"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    ws_ce.row_dimensions[2].height = 30
+
+    if not result.conceptos_especiales.empty:
+        ce_df = result.conceptos_especiales.copy()
+        nxt_ce = _write_table(ws_ce, 3,
+            ["Fecha", "Concepto", "Comprobante", "Débito ($)", "Crédito ($)"],
+            ce_df, row_bg="FEF9C3", hdr_bg="B45309", num_cols=[4, 5])
+        for c in range(1, 6):
+            _dat(ws_ce.cell(row=nxt_ce, column=c), bg="FDE68A", bold=True)
+        ws_ce.cell(row=nxt_ce, column=3, value="TOTAL")
+        ws_ce.cell(row=nxt_ce, column=4, value=result.monto_conceptos_especiales)
+        ws_ce.cell(row=nxt_ce, column=4).number_format = "#,##0.00"
+
+    # ── HOJA 6: Mayor sin Banco ───────────────────────────────────────────
     ws4 = wb.create_sheet("Mayor sin Banco")
     for col, w in zip("ABCDE", [14, 52, 14, 18, 30]):
         ws4.column_dimensions[col].width = w
@@ -285,7 +320,7 @@ def build_excel(result: ReconciliationResult, banco_nombre: str, periodo: str) -
             result.mayor_sin_banco_haber.assign(Nota="En sistema, no en banco"),
             row_bg=C["gray_bg"], hdr_bg=C["dark_gray"], num_cols=[4])
 
-    # ── HOJA 5: Extracto Completo ─────────────────────────────────────────
+    # ── HOJA 7: Extracto Completo ─────────────────────────────────────────
     ws5 = wb.create_sheet("Extracto Completo")
     for col, w in zip("ABCDEF", [14, 46, 24, 16, 16, 20]):
         ws5.column_dimensions[col].width = w
