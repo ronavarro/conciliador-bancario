@@ -229,7 +229,32 @@ def reconcile(
         else:
             unmatched_deb_idx.append(int(row["_idx"]))
 
-    # PASS 2: Conceptos Especiales — movimientos entre cuentas, FCI, etc. (revisión manual)
+    # PASS 2: Depósito de cheques — DEPOS.CHQ en banco ↔ concepto MB... en mayor, monto exacto
+    _dep_bank_pat  = cfg.get("deposit_cheque_bank_pattern",  "depos.chq")
+    _dep_mayor_pre = cfg.get("deposit_cheque_mayor_prefix",  "mb")
+
+    for bidx in list(unmatched_cred_idx):
+        if _dep_bank_pat not in _norm_text(bank_df.loc[bidx, "Concepto"]):
+            continue
+        credito = bank_df.loc[bidx, "Credito"]
+        candidates = pool_debe[
+            (~pool_debe["_used"])
+            & (abs(pool_debe["Debe"] - credito) < tol)
+            & pool_debe["Descripcion"].apply(lambda d: _norm_text(d).startswith(_dep_mayor_pre))
+        ]
+        if not candidates.empty:
+            hidx = candidates.index[0]
+            pool_debe.loc[hidx, "_used"] = True
+            asiento = pool_debe.loc[hidx, "Asiento"]
+            bank_df.loc[bidx, ["_matched", "_match_type", "_match_reason"]] = [
+                True,
+                "deposito_cheque",
+                f"Depósito de cheque conciliado contra asiento {asiento} en mayor",
+            ]
+            unmatched_cred_idx.remove(bidx)
+            decision_log.append(f"DEPOS.CHQ conciliado con asiento {asiento} del mayor.")
+
+    # PASS 3: Conceptos Especiales — movimientos entre cuentas, FCI, etc. (revisión manual)
     bank_name = banco or ""
     rules = cfg.get("bank_rules", {}).get(bank_name, {})
     special_patterns = rules.get("special_patterns", [])
@@ -250,7 +275,7 @@ def reconcile(
                 if bidx in unmatched_cred_idx:
                     unmatched_cred_idx.remove(bidx)
 
-    # PASS 3: Cargos bancarios — gastos e impuestos
+    # PASS 4: Cargos bancarios — gastos e impuestos
     include_patterns = rules.get("include_patterns", [])
     exclude_patterns = rules.get("exclude_patterns", [])
     fund_patterns = cfg.get("fund_patterns", [])
@@ -319,7 +344,7 @@ def reconcile(
                     bank_df.loc[bidx, "_match_type"] = "gastos_impuestos"
                     break
 
-    # PASS 4: Transferencias con tolerancia fecha + agrupación
+    # PASS 5: Transferencias con tolerancia fecha + agrupación
     transfer_patterns = cfg.get("transfer_include_patterns", [])
     transfer_tol_days = int(cfg.get("transfer_date_tolerance_days", 3))
 
@@ -409,7 +434,7 @@ def reconcile(
             "Transfer candidate found but not enough confidence to auto-match",
         ]
 
-    # PASS 5: Cheques de períodos previos (si hay archivo auxiliar)
+    # PASS 6: Cheques de períodos previos (si hay archivo auxiliar)
     cheque_patterns = cfg.get("cheque_patterns", [])
     if cheques_df is not None and not cheques_df.empty:
         for bidx in list(unmatched_deb_idx):
@@ -436,7 +461,7 @@ def reconcile(
             unmatched_deb_idx.remove(bidx)
             decision_log.append("Matched cheque issued in previous period.")
 
-    # PASS 6: Enriquecimiento opcional por CUIT/proveedor
+    # PASS 7: Enriquecimiento opcional por CUIT/proveedor
     if supplier_df is not None and not supplier_df.empty:
         for bidx in unmatched_deb_idx + unmatched_cred_idx:
             row = bank_df.loc[bidx]
@@ -453,7 +478,7 @@ def reconcile(
             add = f"CUIT matched with supplier table: {names or cuit}"
             bank_df.loc[bidx, "_match_reason"] = f"{prev_reason} | {add}" if prev_reason else add
 
-    # PASS 7: Detección fondos comunes — no clasificar como cargos
+    # PASS 8: Detección fondos comunes — no clasificar como cargos
 
     for bidx in unmatched_deb_idx + unmatched_cred_idx:
         if bank_df.loc[bidx, "_matched"]:

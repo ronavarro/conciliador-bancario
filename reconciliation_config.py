@@ -12,6 +12,9 @@ DEFAULT_RECONCILIATION_CONFIG = {
     "consolidated_amount_tolerance": 1.0,
     "transfer_date_tolerance_days": 3,
     "end_of_month_tolerance_days": 5,
+    # Depósito de cheques: concepto banco comienza con este patrón → buscar en mayor con prefijo MB
+    "deposit_cheque_bank_pattern": "depos.chq",
+    "deposit_cheque_mayor_prefix": "mb",
     "transfer_include_patterns": ["transfer", "trf", "cte a cte", "interbank"],
     "fund_patterns": ["fondo comun", "money market", "fci", "resc", "suscrip"],
     "cheque_patterns": ["cheque", "chq"],
