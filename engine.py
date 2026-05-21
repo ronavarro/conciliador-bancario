@@ -306,6 +306,19 @@ def reconcile(
                 for bidx in grp_idxs:
                     bank_df.loc[bidx, "_match_reason"] = reason
 
+    # Patrones condicionales por monto (e.g. "debitos" BNA: ≤ umbral → gasto, > umbral → normal)
+    amount_threshold_patterns = rules.get("amount_threshold_patterns", [])
+    if amount_threshold_patterns:
+        for bidx in list(unmatched_deb_idx):
+            concepto = _norm_text(bank_df.loc[bidx, "Concepto"])
+            amt = abs(bank_df.loc[bidx, "Debito"])
+            for atp in amount_threshold_patterns:
+                if atp["pattern"] in concepto and amt <= float(atp["max_amount"]):
+                    unmatched_deb_idx.remove(bidx)
+                    gastos_impuestos_idxs.append(bidx)
+                    bank_df.loc[bidx, "_match_type"] = "gastos_impuestos"
+                    break
+
     # PASS 4: Transferencias con tolerancia fecha + agrupación
     transfer_patterns = cfg.get("transfer_include_patterns", [])
     transfer_tol_days = int(cfg.get("transfer_date_tolerance_days", 3))

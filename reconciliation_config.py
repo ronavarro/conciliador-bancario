@@ -23,14 +23,14 @@ DEFAULT_RECONCILIATION_CONFIG = {
                 # desde el Excel:
                 "sellado", "int.cob.acue", "reg rec sirc", "gp-comision",
                 "gp-com.trans", "gp-cable tra", "gp-gastos ou", "gp-iva tasa",
-                "gp-percep.iv", "comi. transf", "ch/clear.48",
+                "gp-percep.iv", "comi. transf",
                 # desde gastos_bancarios.csv:
                 "impuesto ley", "com.transf comision", "iva tasa gra", "comision tra",
                 "gp-comision cumpl impo", "percepcion i", "comision ext efectivo",
                 "gp-comision altseg despacho", "iva tasa red", "ley nro 25.4",
                 "comision ges", "com.transfer comision", "comision man", "comision mov",
             ],
-            "exclude_patterns": ["transferencia", "cheque", "fondo comun", "afip"],
+            "exclude_patterns": ["transferencia", "cheque", "fondo comun", "afip", "ch/clear"],
             "special_patterns": [
                 # Movimientos entre cuentas / fondos comunes de inversión — revisión manual
                 "cje. interno",
@@ -44,7 +44,7 @@ DEFAULT_RECONCILIATION_CONFIG = {
                 "gravamen ley", "reg.rec.sircreb", "reten. i.v.a.", "debito automatico",
                 "reintegro ley", "com transfe electronica", "comis. canje",
                 # detectados en extracto:
-                "i.b.reg re", "co.trf.ele", "ch/recib48", "pgo.t/cred",
+                "i.b.reg re", "co.trf.ele", "ch/recib48",
                 "trf.red", "deb.aut.se", "ch/de inte",
                 # desde gastos_bancarios.csv:
                 "gravamen ley 25413 s/deb", "gravamen ley 25413 s/cred",
@@ -53,7 +53,11 @@ DEFAULT_RECONCILIATION_CONFIG = {
                 "reintegro ley 25413/deb", "comis. gasto chequera",
                 "com.ch clearing o aplic.a",
             ],
-            "exclude_patterns": ["transferencia", "cheque", "fondo comun", "afip"],
+            "exclude_patterns": ["transferencia", "cheque", "fondo comun", "afip", "pgo.t/cred"],
+            "amount_threshold_patterns": [
+                # "debitos" ≤ 1500 → gasto bancario; > 1500 → conciliar normalmente
+                {"pattern": "debitos", "max_amount": 1500},
+            ],
             "special_patterns": [
                 # Movimientos entre cuentas / operaciones especiales — revisión manual
                 "abono interpyme",
