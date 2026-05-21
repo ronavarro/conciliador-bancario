@@ -44,7 +44,7 @@ DEFAULT_RECONCILIATION_CONFIG = {
                 "gravamen ley", "reg.rec.sircreb", "reten. i.v.a.", "debito automatico",
                 "reintegro ley", "com transfe electronica", "comis. canje",
                 # detectados en extracto:
-                "i.b.reg re", "co.trf.ele", "debitos", "ch/recib48", "pgo.t/cred",
+                "i.b.reg re", "co.trf.ele", "ch/recib48", "pgo.t/cred",
                 "trf.red", "deb.aut.se", "ch/de inte",
                 # desde gastos_bancarios.csv:
                 "gravamen ley 25413 s/deb", "gravamen ley 25413 s/cred",
