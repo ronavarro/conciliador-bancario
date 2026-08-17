@@ -369,9 +369,11 @@ if st.session_state.result is not None:
     st.markdown("<br>", unsafe_allow_html=True)
 
     # ── Tabs de detalle ────────────────────────────────────────────────────
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    tab1, tab_chq, tab_fci, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         f"🚨 Faltantes ({result.total_faltantes})",
-        f"🧾 Gastos e Impuestos ({len(result.gastos_impuestos)})",
+        f"🧾 Cheques ({len(result.cheques_debe)})",
+        f"💹 Mov. Financieros ({len(result.movimientos_financieros)})",
+        f"💸 Gastos e Impuestos ({len(result.gastos_impuestos)})",
         f"🔍 Conceptos Especiales ({len(result.conceptos_especiales)})",
         f"📋 Extracto completo ({result.banco_total})",
         f"📒 Mayor sin banco ({len(result.mayor_sin_banco_debe) + len(result.mayor_sin_banco_haber)})",
@@ -416,6 +418,46 @@ if st.session_state.result is not None:
                 result.sugerencias_conciliacion.style.format(sug_fmt),
                 use_container_width=True, hide_index=True,
             )
+
+    with tab_chq:
+        st.markdown('<div class="section-title">Cheques — Debe de acreditación sin conciliar</div>', unsafe_allow_html=True)
+        st.caption(
+            "El **Haber** de la acreditación ya concilió contra el débito del banco. "
+            "Este **Debe** queda suelto: corresponde al pago con cheque de un mes anterior. "
+            "Cruzalo **por monto** contra un Haber sin conciliar del output del mes de emisión "
+            "(el pago al proveedor, que en el mayor figura como pago normal, no como cheque)."
+        )
+        if result.cheques_debe.empty:
+            st.success("✅ No hay cheques (Debe de acreditación) sin conciliar en este período.")
+        else:
+            chq_view = result.cheques_debe[["Fecha", "Asiento", "Descripcion", "Debe"]]
+            st.dataframe(
+                chq_view.style.format({"Debe": "${:,.2f}"}),
+                use_container_width=True, hide_index=True
+            )
+            st.caption(f"Total: **${result.monto_cheques_debe:,.2f}** · {len(result.cheques_debe)} movimiento(s)")
+
+    with tab_fci:
+        st.markdown('<div class="section-title">Movimientos Financieros (FCI)</div>', unsafe_allow_html=True)
+        st.caption(
+            "Suscripciones y rescates de FCI, y la **retención de renta financiera** asociada "
+            "(IIBB sobre la ganancia del rescate, identificada por su contrapartida "
+            "'Ret Renta Financiera' en el mayor). Se separan **siempre** del circuito operativo: "
+            "no cuentan como conciliados, faltantes ni como gastos/impuestos operativos."
+        )
+        if result.movimientos_financieros.empty:
+            st.info("No se detectaron movimientos de FCI en este período.")
+        else:
+            fmt_fci = {}
+            if "Debito" in result.movimientos_financieros.columns:
+                fmt_fci["Debito"] = "${:,.2f}"
+            if "Credito" in result.movimientos_financieros.columns:
+                fmt_fci["Credito"] = "${:,.2f}"
+            st.dataframe(
+                result.movimientos_financieros.style.format(fmt_fci),
+                use_container_width=True, hide_index=True
+            )
+            st.caption(f"Total: **${result.monto_movimientos_financieros:,.2f}** · {len(result.movimientos_financieros)} movimiento(s)")
 
     with tab2:
         if result.gastos_impuestos.empty:
@@ -479,6 +521,8 @@ if st.session_state.result is not None:
         def highlight_estado(row):
             if row.get("Estado") == "⚠ No en sistema":
                 return ["background-color: #FEF2F2"] * len(row)
+            if row.get("Estado") == "💹 Financiero (FCI)":
+                return ["background-color: #F5F3FF"] * len(row)
             return ["background-color: #F0FDF4" if i % 2 == 0 else "" for i in range(len(row))]
 
         styled = (
@@ -514,6 +558,8 @@ if st.session_state.result is not None:
                 return ["background-color: #F0FDF4"] * len(row)
             if estado == "⚠ Sin conciliar":
                 return ["background-color: #FEF2F2"] * len(row)
+            if estado == "🧾 Cheque Debe sin conciliar":
+                return ["background-color: #F0FDFA; color: #115E59"] * len(row)
             if estado == "— Descartado":
                 return ["background-color: #F9FAFB; color: #9CA3AF"] * len(row)
             return [""] * len(row)
@@ -534,6 +580,9 @@ if st.session_state.result is not None:
         El archivo Excel incluye:
         - **Resumen ejecutivo** con KPIs y estado general
         - **Faltantes Créditos** y **Faltantes Débitos** destacados
+        - **Sugerencias** — faltantes con importe cercano (±5%) a un asiento del mayor en otra fecha
+        - **Cheques** — Debe de acreditación sin conciliar, para cruzar por monto con el mes de emisión
+        - **Movimientos Financieros** — suscripción/rescate de FCI, separados del circuito operativo
         - **Conceptos Especiales** — operaciones que requieren revisión manual
         - **Mayor sin Banco** — asientos que están en el sistema pero no en el extracto
         - **Extracto Completo** con cada movimiento marcado como conciliado o faltante

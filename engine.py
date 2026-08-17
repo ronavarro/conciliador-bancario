@@ -57,6 +57,15 @@ class ReconciliationResult:
     # Conceptos especiales (movimientos entre cuentas, FCI, etc.) — revisión manual
     conceptos_especiales: pd.DataFrame = field(default_factory=pd.DataFrame)
 
+    # Cheques: Debe de "acreditación de cheques propios" sin conciliar.
+    # Es la punta que compensa contra el Haber sin conciliar del mes de emisión
+    # (pago al proveedor). Se cruza por monto entre meses (no por fecha ni concepto).
+    cheques_debe: pd.DataFrame = field(default_factory=pd.DataFrame)
+
+    # Movimientos financieros (FCI): suscripción/rescate de fondos comunes de
+    # inversión. Se separan SIEMPRE del circuito operativo (matcheen o no).
+    movimientos_financieros: pd.DataFrame = field(default_factory=pd.DataFrame)
+
     # Trazabilidad
     decision_log: list[str] = field(default_factory=list)
 
@@ -75,6 +84,21 @@ class ReconciliationResult:
     @property
     def monto_gastos_impuestos(self):
         return self.gastos_impuestos["Debito"].abs().sum() if not self.gastos_impuestos.empty else 0
+
+    @property
+    def monto_cheques_debe(self):
+        return self.cheques_debe["Debe"].sum() if not self.cheques_debe.empty else 0
+
+    @property
+    def monto_movimientos_financieros(self):
+        if self.movimientos_financieros.empty:
+            return 0
+        total = 0
+        if "Debito" in self.movimientos_financieros.columns:
+            total += self.movimientos_financieros["Debito"].abs().sum()
+        if "Credito" in self.movimientos_financieros.columns:
+            total += self.movimientos_financieros["Credito"].abs().sum()
+        return total
 
     @property
     def monto_conceptos_especiales(self):
@@ -169,24 +193,76 @@ def reconcile(
     pool_debe = mayor_df[mayor_df["Debe"] > 0][["Fecha", "Descripcion", "Debe", "Asiento"]].copy().reset_index(drop=True)
     pool_haber = mayor_df[mayor_df["Haber"] > 0][["Fecha", "Descripcion", "Haber", "Asiento"]].copy().reset_index(drop=True)
 
-    # Excluir del Debe conceptos que no deben conciliarse ni aparecer en "Mayor sin banco"
-    debe_ignore = cfg.get("mayor_debe_ignore_patterns", [])
-    mayor_debe_descartados: pd.DataFrame = pd.DataFrame(columns=["Fecha", "Descripcion", "Asiento", "Debe"])
-    if debe_ignore:
+    # Separar del Debe la "acreditación de cheques propios": es un asiento banco/banco
+    # cuyo Haber concilia contra el débito del banco, pero cuyo Debe queda suelto.
+    # Ese Debe NO es un faltante ni se descarta: se aparta al bucket "Cheques Debe
+    # sin conciliar" para cruzarlo por monto contra el Haber sin conciliar del mes
+    # de emisión (el pago al proveedor).
+    cheque_debe_patterns = (
+        cfg.get("cheque_acreditacion_debe_patterns")
+        or cfg.get("mayor_debe_ignore_patterns", [])
+    )
+    cheques_debe_raw: pd.DataFrame = pd.DataFrame(columns=["Fecha", "Descripcion", "Asiento", "Debe"])
+    if cheque_debe_patterns and not pool_debe.empty:
         def _norm(s: str) -> str:
             return unicodedata.normalize("NFD", str(s).lower()).encode("ascii", "ignore").decode()
-        normed_ignore = [_norm(p) for p in debe_ignore]
-        mask_ignore = pool_debe["Descripcion"].apply(
-            lambda d: any(p in _norm(d) for p in normed_ignore)
+        normed_patterns = [_norm(p) for p in cheque_debe_patterns]
+        mask_cheque = pool_debe["Descripcion"].apply(
+            lambda d: any(p in _norm(d) for p in normed_patterns)
         )
-        mayor_debe_descartados = pool_debe[mask_ignore][["Fecha", "Descripcion", "Asiento", "Debe"]].copy()
-        pool_debe = pool_debe[~mask_ignore].reset_index(drop=True)
+        cheques_debe_raw = pool_debe[mask_cheque][["Fecha", "Descripcion", "Asiento", "Debe"]].copy()
+        pool_debe = pool_debe[~mask_cheque].reset_index(drop=True)
+        if not cheques_debe_raw.empty:
+            decision_log.append(
+                f"{len(cheques_debe_raw)} Debe(s) de acreditación de cheques separados "
+                f"para cruce por monto contra el Haber sin conciliar del mes de emisión."
+            )
     pool_debe["_used"] = False
     pool_haber["_used"] = False
 
     bank_cred = bank_df[bank_df["Credito"] > 0].copy()
     bank_deb = bank_df[bank_df["Debito"] < 0].copy()
     bank_deb["_abs"] = bank_deb["Debito"].abs()
+
+    # PASS RF: Renta financiera (retención de IIBB sobre la ganancia del rescate de FCI).
+    # Se determina por la CONTRAPARTIDA en el mayor: asientos "Ret Renta Financiera"
+    # (el ERP ya la etiqueta como financiera). Se separa SIEMPRE del circuito operativo
+    # → va a Movimientos Financieros, no cuenta como gasto/impuesto ni como conciliación
+    # operativa. Corre antes del match exacto para que no quede como "conciliado".
+    rf_patterns = cfg.get("renta_financiera_mayor_patterns", [])
+    rf_tol_days = int(cfg.get("renta_financiera_date_tolerance_days", 5))
+    renta_financiera_idxs: list[int] = []
+    if rf_patterns:
+        def _norm_rf(s: str) -> str:
+            return unicodedata.normalize("NFD", str(s).lower()).encode("ascii", "ignore").decode()
+        rf_normed = [_norm_rf(p) for p in rf_patterns]
+        rf_mask = pool_haber["Descripcion"].apply(lambda d: any(p in _norm_rf(d) for p in rf_normed))
+        if rf_mask.any():
+            for _, brow in bank_deb.iterrows():
+                amt = brow["_abs"]
+                cand = pool_haber[
+                    rf_mask
+                    & (~pool_haber["_used"])
+                    & (abs(pool_haber["Haber"] - amt) < tol)
+                    & ((pool_haber["Fecha"] - brow["Fecha"]).abs().dt.days <= rf_tol_days)
+                ]
+                if not cand.empty:
+                    hidx = cand.index[0]
+                    pool_haber.loc[hidx, "_used"] = True
+                    bidx = int(brow["_idx"])
+                    renta_financiera_idxs.append(bidx)
+                    bank_df.loc[bidx, ["_matched", "_match_type", "_match_reason"]] = [
+                        False,
+                        "renta_financiera",
+                        f"Renta financiera (retención sobre rescate FCI) — asiento {pool_haber.loc[hidx, 'Asiento']} del mayor",
+                    ]
+            if renta_financiera_idxs:
+                # No participan del match operativo
+                bank_deb = bank_deb[~bank_deb["_idx"].isin(renta_financiera_idxs)]
+                decision_log.append(
+                    f"{len(renta_financiera_idxs)} movimiento(s) de renta financiera separados "
+                    f"(contrapartida 'Ret Renta Financiera' en el mayor)."
+                )
 
     # MATCH PASS 1: Lógica original exacta fecha+importe
     matched_cred_idx, unmatched_cred_idx = [], []
@@ -229,6 +305,34 @@ def reconcile(
         else:
             unmatched_deb_idx.append(int(row["_idx"]))
 
+    # Reglas del banco (se usan en varios pases de acá en adelante)
+    bank_name = banco or ""
+    rules = cfg.get("bank_rules", {}).get(bank_name, {})
+
+    # PASS FCI: Movimientos financieros (FCI) — se separan SIEMPRE, matcheen o no.
+    # Suscripción/rescate de fondos comunes. Quedan fuera del circuito operativo:
+    # no cuentan como conciliados ni como faltantes. Corre después del match exacto
+    # para que, si consumieron un asiento del mayor, ese asiento no quede huérfano.
+    fci_patterns = rules.get("fci_patterns", [])
+    movimientos_financieros_idxs: list[int] = []
+    if fci_patterns:
+        for bidx in list(bank_df.index):
+            if _is_special_concept(bank_df.loc[bidx, "Concepto"], fci_patterns):
+                movimientos_financieros_idxs.append(bidx)
+                if bidx in unmatched_cred_idx:
+                    unmatched_cred_idx.remove(bidx)
+                if bidx in unmatched_deb_idx:
+                    unmatched_deb_idx.remove(bidx)
+                bank_df.loc[bidx, ["_matched", "_match_type", "_match_reason"]] = [
+                    False,
+                    "movimientos_financieros",
+                    "Movimiento financiero (FCI) — separado del circuito operativo",
+                ]
+        if movimientos_financieros_idxs:
+            decision_log.append(
+                f"{len(movimientos_financieros_idxs)} movimiento(s) de FCI separados a Movimientos Financieros."
+            )
+
     # PASS 2: Depósito de cheques — DEPOS.CHQ en banco ↔ concepto MB... en mayor, monto exacto
     _dep_bank_pat  = cfg.get("deposit_cheque_bank_pattern",  "depos.chq")
     _dep_mayor_pre = cfg.get("deposit_cheque_mayor_prefix",  "mb")
@@ -254,9 +358,7 @@ def reconcile(
             unmatched_cred_idx.remove(bidx)
             decision_log.append(f"DEPOS.CHQ conciliado con asiento {asiento} del mayor.")
 
-    # PASS 3: Conceptos Especiales — movimientos entre cuentas, FCI, etc. (revisión manual)
-    bank_name = banco or ""
-    rules = cfg.get("bank_rules", {}).get(bank_name, {})
+    # PASS 3: Conceptos Especiales — movimientos entre cuentas u operaciones especiales (revisión manual)
     special_patterns = rules.get("special_patterns", [])
 
     conceptos_especiales_idxs: list[int] = []
@@ -495,11 +597,21 @@ def reconcile(
     faltantes_deb = _build_df_from_indexes(bank_df, unmatched_deb_idx)
     gastos_impuestos_df = _build_df_from_indexes(bank_df, gastos_impuestos_idxs)
     conceptos_especiales_df = _build_df_from_indexes(bank_df, conceptos_especiales_idxs)
+    # Movimientos financieros = FCI (suscripción/rescate) + renta financiera (su retención)
+    movimientos_financieros_df = _build_df_from_indexes(
+        bank_df, movimientos_financieros_idxs + renta_financiera_idxs
+    )
 
     mayor_sb_debe = pool_debe[~pool_debe["_used"]][["Fecha", "Descripcion", "Asiento", "Debe"]].copy()
     mayor_sb_haber = pool_haber[~pool_haber["_used"]][["Fecha", "Descripcion", "Asiento", "Haber"]].copy()
     for df in [mayor_sb_debe, mayor_sb_haber]:
         df["Fecha"] = pd.to_datetime(df["Fecha"]).dt.strftime("%d/%m/%Y")
+
+    # Cheques Debe sin conciliar — ordenado y formateado para salida
+    cheques_debe_out = cheques_debe_raw[["Fecha", "Descripcion", "Asiento", "Debe"]].copy()
+    if not cheques_debe_out.empty:
+        cheques_debe_out = cheques_debe_out.sort_values("Fecha").reset_index(drop=True)
+        cheques_debe_out["Fecha"] = pd.to_datetime(cheques_debe_out["Fecha"]).dt.strftime("%d/%m/%Y")
 
     # Mayor completo: todas las filas de los pools con su estado
     _mc_parts = []
@@ -515,12 +627,12 @@ def reconcile(
         _part["Estado"] = _estado_val
         _mc_parts.append(_part)
 
-    if not mayor_debe_descartados.empty:
-        _desc = mayor_debe_descartados[["Fecha", "Descripcion", "Asiento", "Debe"]].copy()
-        _desc.rename(columns={"Debe": "Importe"}, inplace=True)
-        _desc["Tipo"] = "Debe"
-        _desc["Estado"] = "— Descartado"
-        _mc_parts.append(_desc)
+    if not cheques_debe_raw.empty:
+        _chq = cheques_debe_raw[["Fecha", "Descripcion", "Asiento", "Debe"]].copy()
+        _chq.rename(columns={"Debe": "Importe"}, inplace=True)
+        _chq["Tipo"] = "Debe"
+        _chq["Estado"] = "🧾 Cheque Debe sin conciliar"
+        _mc_parts.append(_chq)
 
     mayor_completo = pd.concat(_mc_parts, ignore_index=True) if _mc_parts else pd.DataFrame()
     if not mayor_completo.empty:
@@ -532,9 +644,13 @@ def reconcile(
     banco_completo = bank_df.copy()
 
     def _estado(r):
+        mt = r.get("_match_type", "")
+        if mt == "movimientos_financieros":
+            return "💹 Financiero (FCI)"
+        if mt == "renta_financiera":
+            return "💹 Renta financiera"
         if r["_matched"]:
             return "✓ Conciliado"
-        mt = r.get("_match_type", "")
         if mt:
             return f"⚠ {mt}"
         return "⚠ No en sistema"
@@ -592,6 +708,8 @@ def reconcile(
         faltantes_debitos=faltantes_deb,
         gastos_impuestos=gastos_impuestos_df,
         conceptos_especiales=conceptos_especiales_df,
+        cheques_debe=cheques_debe_out.reset_index(drop=True),
+        movimientos_financieros=movimientos_financieros_df,
         mayor_sin_banco_debe=mayor_sb_debe.reset_index(drop=True),
         mayor_sin_banco_haber=mayor_sb_haber.reset_index(drop=True),
         banco_completo=banco_completo,

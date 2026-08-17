@@ -4,11 +4,24 @@ from __future__ import annotations
 
 DEFAULT_RECONCILIATION_CONFIG = {
     "amount_tolerance": 0.02,
-    # Conceptos del mayor que, cuando tienen valor en Debe, deben ignorarse por completo
-    # (no se concilian ni aparecen en "Mayor sin banco").
+    # Conceptos del mayor que, cuando tienen valor en Debe, corresponden a la
+    # ACREDITACIÓN de un cheque propio (asiento banco/banco). El Haber de ese
+    # asiento concilia contra el débito del banco; el Debe queda suelto y NO debe
+    # tratarse como faltante ni descartarse: se separa en el bucket "Cheques Debe
+    # sin conciliar" para cruzarlo por monto contra el Haber sin conciliar del mes
+    # de emisión (el pago al proveedor, que en el mayor aparece como pago normal).
+    "cheque_acreditacion_debe_patterns": [
+        "acreditacion de cheques propios",
+    ],
+    # (compat) alias histórico — se sigue leyendo si el nuevo no está presente.
     "mayor_debe_ignore_patterns": [
         "acreditacion de cheques propios",
     ],
+    # Renta financiera: retención de IIBB sobre la ganancia del rescate de FCI.
+    # Se identifica por la contrapartida en el mayor (el ERP la etiqueta así),
+    # no por el concepto del banco (que es ambiguo: RET. IB, RRSIRCREB, etc.).
+    "renta_financiera_mayor_patterns": ["ret renta financiera"],
+    "renta_financiera_date_tolerance_days": 5,
     "consolidated_amount_tolerance": 1.0,
     "transfer_date_tolerance_days": 3,
     "end_of_month_tolerance_days": 5,
@@ -34,11 +47,12 @@ DEFAULT_RECONCILIATION_CONFIG = {
                 "comision ges", "com.transfer comision", "comision man", "comision mov",
             ],
             "exclude_patterns": ["transferencia", "cheque", "fondo comun", "afip", "ch/clear"],
-            "special_patterns": [
-                # Movimientos entre cuentas / fondos comunes de inversión — revisión manual
-                "cje. interno",
-                "oper. fdo.co",
-            ],
+            # "cje. interno" (canje interno) se sacó de special: es un movimiento
+            # reconciliable normal contra el mayor. "oper. fdo.co" pasó a fci_patterns.
+            "special_patterns": [],
+            # Movimientos de FCI: se separan SIEMPRE a "Movimientos Financieros"
+            # (matcheen o no), fuera del circuito operativo.
+            "fci_patterns": ["oper. fdo.co"],
         },
         "BNA": {
             "include_patterns": [
@@ -65,6 +79,8 @@ DEFAULT_RECONCILIATION_CONFIG = {
                 # Movimientos entre cuentas / operaciones especiales — revisión manual
                 "abono interpyme",
             ],
+            # No se observaron movimientos de FCI en BNA; se puede completar más adelante.
+            "fci_patterns": [],
         },
         "Macro": {
             "include_patterns": [
@@ -75,6 +91,7 @@ DEFAULT_RECONCILIATION_CONFIG = {
                 "impuesto al debito", "impuesto al credito", "iva 21%",
             ],
             "exclude_patterns": ["transferencia", "cheque", "fondo comun", "afip"],
+            "fci_patterns": ["fdo.com.in"],
         },
         "Santander": {
             "include_patterns": [
@@ -85,6 +102,7 @@ DEFAULT_RECONCILIATION_CONFIG = {
                 "impuesto al debito", "impuesto al credito", "impuestos",
             ],
             "exclude_patterns": ["transferencia", "cheque", "fondo comun", "afip"],
+            "fci_patterns": ["suscri.fci", "resc.fci"],
         },
     },
 }
